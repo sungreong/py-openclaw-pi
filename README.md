@@ -23,6 +23,22 @@
    docker-compose up --build
    ```
 
+## 경량 메모리 모드
+
+에이전트는 기본적으로 세션별 장기 메모리를 `.openclaw_pi/memory/<session>.jsonl`에 저장합니다.
+메모리는 규칙 기반으로 선호/제약/할 일/사실을 추출하며, 다음 턴 입력 전에 관련 항목만 일부 재주입합니다.
+
+- 비활성화: `PI_NO_MEMORY=true` 또는 CLI `--no-memory`
+- 저장 개수 제한: `PI_MEMORY_LIMIT` 또는 CLI `--memory-limit`
+- 재호출 개수 제한: `PI_MEMORY_RECALL_LIMIT` 또는 CLI `--memory-recall-limit`
+- 메모리 디렉터리: `PI_MEMORY_DIR` 또는 CLI `--memory-dir`
+- 검색 백엔드: `PI_MEMORY_SEARCH_BACKEND` 또는 CLI `--memory-search-backend` (`sqlite-vec`/`keyword`)
+- 임베딩 제공자: `PI_MEMORY_EMBEDDING_PROVIDER` 또는 CLI `--memory-embedding-provider` (`auto`/`openai`/`hash`)
+- 임베딩 모델: `PI_MEMORY_EMBEDDING_MODEL` 또는 CLI `--memory-embedding-model` (예: `text-embedding-3-small`)
+
+`sqlite-vec` 백엔드는 OpenClaw 방식처럼 SQLite + 벡터 거리(`vec_distance_cosine`)를 우선 사용하고,
+확장 로딩이 불가능한 환경에서는 동일 DB에서 코사인 점수 폴백 검색으로 동작합니다.
+
 ## 기여
 
 기여를 원하신다면, 이 저장소를 포크하고 변경 사항을 반영한 후 풀 리퀘스트를 제출해 주세요.

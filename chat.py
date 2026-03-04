@@ -31,6 +31,15 @@ from openclaw_pi_langchain import (
 )
 
 
+def _safe_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"⚠️ 잘못된 정수 환경변수 {name}={raw!r}, 기본값 {default} 사용")
+        return default
+
+
 class ColoredChatCallbacks(PiCallbacks):
     """
     터미널에서 툴 실행 상태와 AI 응답을 색깔로 예쁘게 구분하여 보여주는 커스텀 콜백
@@ -72,14 +81,29 @@ def main():
         workspace_dir=os.getenv("PI_WORKSPACE", "."),
         session_dir=os.getenv("PI_SESSION_DIR", ".openclaw_pi/sessions"),
         audit_dir=os.getenv("PI_AUDIT_DIR", ".openclaw_pi/audit"),
-        max_model_calls=int(os.getenv("PI_MAX_MODEL_CALLS", "16")),
-        exec_timeout_s=int(os.getenv("PI_EXEC_TIMEOUT", "60")),
+        max_model_calls=_safe_int_env("PI_MAX_MODEL_CALLS", 16),
+        exec_timeout_s=_safe_int_env("PI_EXEC_TIMEOUT", 60),
         allow_write=os.getenv("PI_NO_WRITE", "false").lower() == "false",
         allow_shell=os.getenv("PI_NO_SHELL", "false").lower() == "false",
         enable_compaction=os.getenv("PI_NO_COMPACTION", "false").lower() == "false",
+        enable_memory=os.getenv("PI_NO_MEMORY", "false").lower() == "false",
+        memory_dir=os.getenv("PI_MEMORY_DIR", ".openclaw_pi/memory"),
+        memory_limit=max(1, _safe_int_env("PI_MEMORY_LIMIT", 200)),
+        memory_recall_limit=max(1, _safe_int_env("PI_MEMORY_RECALL_LIMIT", 5)),
+        memory_search_backend=os.getenv("PI_MEMORY_SEARCH_BACKEND", "sqlite-vec"),
+        memory_embedding_provider=os.getenv("PI_MEMORY_EMBEDDING_PROVIDER", "auto"),
+        memory_embedding_model=os.getenv("PI_MEMORY_EMBEDDING_MODEL", "text-embedding-3-small"),
     )
     
-    agent = OpenClawPiLangChain(config)
+    try:
+        agent = OpenClawPiLangChain(config)
+    except Exception as e:
+        print(f"{Fore.RED}에이전트 초기화 실패: {e}{Style.RESET_ALL}")
+        print(
+            f"{Fore.YELLOW}힌트: OPENAI_API_KEY(또는 선택한 모델 제공자 키) 설정을 확인하세요.{Style.RESET_ALL}"
+        )
+        return
+
     session_id = os.getenv("PI_SESSION", "chat_main")
     callbacks = ColoredChatCallbacks()
 
