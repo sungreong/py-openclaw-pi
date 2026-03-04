@@ -32,6 +32,12 @@
 - 저장 개수 제한: `PI_MEMORY_LIMIT` 또는 CLI `--memory-limit`
 - 재호출 개수 제한: `PI_MEMORY_RECALL_LIMIT` 또는 CLI `--memory-recall-limit`
 - 메모리 디렉터리: `PI_MEMORY_DIR` 또는 CLI `--memory-dir`
+- 검색 백엔드: `PI_MEMORY_SEARCH_BACKEND` 또는 CLI `--memory-search-backend` (`sqlite-vec`/`keyword`)
+- 임베딩 제공자: `PI_MEMORY_EMBEDDING_PROVIDER` 또는 CLI `--memory-embedding-provider` (`auto`/`openai`/`hash`)
+- 임베딩 모델: `PI_MEMORY_EMBEDDING_MODEL` 또는 CLI `--memory-embedding-model` (예: `text-embedding-3-small`)
+
+`sqlite-vec` 백엔드는 OpenClaw 방식처럼 SQLite + 벡터 거리(`vec_distance_cosine`)를 우선 사용하고,
+확장 로딩이 불가능한 환경에서는 동일 DB에서 코사인 점수 폴백 검색으로 동작합니다.
 
 ## 기여
 

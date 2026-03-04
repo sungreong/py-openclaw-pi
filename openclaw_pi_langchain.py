@@ -2,9 +2,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import os
 import re
+import sqlite3
+import struct
 import subprocess
 import sys
 import time
@@ -50,6 +54,9 @@ class PiAgentConfig:
     memory_dir: str = ".openclaw_pi/memory"
     memory_limit: int = 200
     memory_recall_limit: int = 5
+    memory_search_backend: str = "sqlite-vec"
+    memory_embedding_provider: str = "auto"
+    memory_embedding_model: str = "text-embedding-3-small"
 
     def workspace_path(self) -> Path:
         return Path(self.workspace_dir).resolve()
@@ -246,6 +253,199 @@ class FlatMemoryStore:
         return path
 
 
+class MemoryEmbeddingClient:
+    def __init__(self, provider: str, model: str):
+        self.requested_provider = (provider or "auto").strip().lower()
+        self.model = (model or "text-embedding-3-small").strip()
+        self.provider = self.requested_provider
+        self._openai_embeddings: Any = None
+        self.error: Optional[str] = None
+
+        if self.requested_provider in {"openai", "auto"}:
+            try:
+                from langchain_openai import OpenAIEmbeddings
+
+                self._openai_embeddings = OpenAIEmbeddings(model=self.model)
+                self.provider = "openai"
+            except Exception as e:
+                self.error = str(e)
+                if self.requested_provider == "openai":
+                    raise
+                self.provider = "hash"
+        elif self.requested_provider == "hash":
+            self.provider = "hash"
+        else:
+            self.provider = "hash"
+
+    def _hash_embed(self, text: str, dims: int = 64) -> list[float]:
+        values: list[float] = []
+        seed = text.encode("utf-8", errors="replace")
+        block = seed
+        while len(values) < dims:
+            block = hashlib.sha256(block).digest()
+            for byte in block:
+                values.append((byte / 127.5) - 1.0)
+                if len(values) >= dims:
+                    break
+        norm = math.sqrt(sum(v * v for v in values)) or 1.0
+        return [v / norm for v in values]
+
+    def embed_query(self, text: str) -> list[float]:
+        if self.provider == "openai" and self._openai_embeddings is not None:
+            vec = self._openai_embeddings.embed_query(text)
+            norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+            return [float(v) / norm for v in vec]
+        return self._hash_embed(text)
+
+
+def _to_float32_blob(values: Sequence[float]) -> bytes:
+    return struct.pack("<" + "f" * len(values), *[float(v) for v in values])
+
+
+def _from_float32_blob(blob: bytes) -> list[float]:
+    if not blob:
+        return []
+    count = len(blob) // 4
+    return list(struct.unpack("<" + "f" * count, blob[: count * 4]))
+
+
+def _cosine_similarity(a: Sequence[float], b: Sequence[float]) -> float:
+    if not a or not b or len(a) != len(b):
+        return -1.0
+    return float(sum(x * y for x, y in zip(a, b)))
+
+
+class SqliteVecMemoryIndex:
+    def __init__(self, db_path: Path, audit_logger: AuditLogger):
+        self.db_path = db_path
+        self.audit_logger = audit_logger
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(str(self.db_path))
+        self.sqlite_vec_ready = False
+        self._init_schema()
+        self._try_load_sqlite_vec()
+
+    def _init_schema(self) -> None:
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memory_vectors (
+                memory_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                content TEXT NOT NULL,
+                ts REAL NOT NULL,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                dim INTEGER NOT NULL,
+                embedding BLOB NOT NULL
+            )
+            """
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_vectors_session_model ON memory_vectors(session_id, provider, model, ts)"
+        )
+        self.conn.commit()
+
+    def _try_load_sqlite_vec(self) -> None:
+        try:
+            import sqlite_vec
+
+            self.conn.enable_load_extension(True)
+            sqlite_vec.load(self.conn)
+            self.sqlite_vec_ready = True
+        except Exception:
+            self.sqlite_vec_ready = False
+
+    def upsert_memory(
+        self,
+        session_id: str,
+        memory: dict[str, Any],
+        embedding: Sequence[float],
+        provider: str,
+        model: str,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO memory_vectors
+            (memory_id, session_id, kind, content, ts, provider, model, dim, embedding)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(memory.get("id", "")),
+                session_id,
+                str(memory.get("kind", "fact")),
+                str(memory.get("content", "")),
+                float(memory.get("ts", _now_ts())),
+                provider,
+                model,
+                len(embedding),
+                _to_float32_blob(embedding),
+            ),
+        )
+        self.conn.commit()
+
+    def trim_session(self, session_id: str, keep_ids: set[str]) -> None:
+        if not keep_ids:
+            self.conn.execute("DELETE FROM memory_vectors WHERE session_id = ?", (session_id,))
+            self.conn.commit()
+            return
+        placeholders = ",".join("?" for _ in keep_ids)
+        self.conn.execute(
+            f"DELETE FROM memory_vectors WHERE session_id = ? AND memory_id NOT IN ({placeholders})",
+            (session_id, *sorted(keep_ids)),
+        )
+        self.conn.commit()
+
+    def search(
+        self,
+        session_id: str,
+        query_embedding: Sequence[float],
+        limit: int,
+        provider: str,
+        model: str,
+    ) -> list[dict[str, Any]]:
+        if not query_embedding:
+            return []
+        if self.sqlite_vec_ready:
+            try:
+                rows = self.conn.execute(
+                    """
+                    SELECT memory_id, kind, content, ts, vec_distance_cosine(embedding, ?) AS dist
+                    FROM memory_vectors
+                    WHERE session_id = ? AND provider = ? AND model = ? AND dim = ?
+                    ORDER BY dist ASC
+                    LIMIT ?
+                    """,
+                    (_to_float32_blob(query_embedding), session_id, provider, model, len(query_embedding), limit),
+                ).fetchall()
+                return [
+                    {
+                        "id": row[0],
+                        "kind": row[1],
+                        "content": row[2],
+                        "ts": row[3],
+                        "score": 1.0 - float(row[4]),
+                    }
+                    for row in rows
+                ]
+            except Exception:
+                pass
+
+        rows = self.conn.execute(
+            """
+            SELECT memory_id, kind, content, ts, embedding
+            FROM memory_vectors
+            WHERE session_id = ? AND provider = ? AND model = ? AND dim = ?
+            """,
+            (session_id, provider, model, len(query_embedding)),
+        ).fetchall()
+        scored: list[dict[str, Any]] = []
+        for row in rows:
+            score = _cosine_similarity(query_embedding, _from_float32_blob(row[4]))
+            scored.append({"id": row[0], "kind": row[1], "content": row[2], "ts": row[3], "score": score})
+        scored.sort(key=lambda x: (float(x.get("score", -1.0)), float(x.get("ts", 0.0))), reverse=True)
+        return scored[:limit]
+
 def _shorten(text: str, limit: int = 12000) -> str:
     if len(text) <= limit:
         return text
@@ -303,6 +503,11 @@ class OpenClawPiLangChain:
         self.session_store = FlatSessionStore(config.session_root())
         self.audit_logger = AuditLogger(config.audit_root())
         self.memory_store = FlatMemoryStore(config.memory_root())
+        self.memory_index = SqliteVecMemoryIndex(config.memory_root() / "memory_vec.sqlite", self.audit_logger)
+        self.embedding_client = MemoryEmbeddingClient(
+            provider=config.memory_embedding_provider,
+            model=config.memory_embedding_model,
+        )
 
         self.model = init_chat_model(
             config.model,
@@ -326,9 +531,37 @@ class OpenClawPiLangChain:
     def _recall_memories(self, session_id: str, prompt: str) -> list[dict[str, Any]]:
         if not self.config.enable_memory:
             return []
+        backend = (self.config.memory_search_backend or "keyword").strip().lower()
         memories = self.memory_store.load(session_id)
         if not memories:
             return []
+
+        if backend == "sqlite-vec":
+            try:
+                query_embedding = self.embedding_client.embed_query(prompt)
+                selected = self.memory_index.search(
+                    session_id=session_id,
+                    query_embedding=query_embedding,
+                    limit=self.config.memory_recall_limit,
+                    provider=self.embedding_client.provider,
+                    model=self.embedding_client.model,
+                )
+                self.audit_logger.log(
+                    session_id,
+                    "memory_recall",
+                    {
+                        "backend": "sqlite-vec",
+                        "requested": self.config.memory_recall_limit,
+                        "returned": len(selected),
+                        "embedding_provider": self.embedding_client.provider,
+                        "embedding_model": self.embedding_client.model,
+                        "sqlite_vec_ready": self.memory_index.sqlite_vec_ready,
+                    },
+                )
+                return selected
+            except Exception as e:
+                self.audit_logger.log(session_id, "memory_recall_fallback", {"reason": str(e)})
+
         prompt_tokens = set(re.findall(r"[a-zA-Z0-9가-힣_]+", prompt.lower()))
 
         def score(item: dict[str, Any]) -> tuple[int, float]:
@@ -342,7 +575,11 @@ class OpenClawPiLangChain:
         self.audit_logger.log(
             session_id,
             "memory_recall",
-            {"requested": self.config.memory_recall_limit, "returned": len(selected)},
+            {
+                "backend": "keyword",
+                "requested": self.config.memory_recall_limit,
+                "returned": len(selected),
+            },
         )
         return selected
 
@@ -407,16 +644,41 @@ class OpenClawPiLangChain:
                 "source_turn": {"prompt": _shorten(prompt, 160), "reply": _shorten(final_text, 160)},
             }
             self.memory_store.append(session_id, memory_record)
+            if (self.config.memory_search_backend or "").lower() == "sqlite-vec":
+                try:
+                    embedding = self.embedding_client.embed_query(str(memory_record.get("content", "")))
+                    self.memory_index.upsert_memory(
+                        session_id=session_id,
+                        memory=memory_record,
+                        embedding=embedding,
+                        provider=self.embedding_client.provider,
+                        model=self.embedding_client.model,
+                    )
+                except Exception as e:
+                    self.audit_logger.log(session_id, "memory_index_write_error", {"reason": str(e)})
             recent_norm.add(normalized)
             appended += 1
 
         if appended:
-            self.audit_logger.log(session_id, "memory_write", {"appended": appended})
+            self.audit_logger.log(
+                session_id,
+                "memory_write",
+                {
+                    "appended": appended,
+                    "backend": self.config.memory_search_backend,
+                    "embedding_provider": self.embedding_client.provider,
+                    "embedding_model": self.embedding_client.model,
+                },
+            )
 
         all_memories = self.memory_store.load(session_id)
         if len(all_memories) > self.config.memory_limit:
             trimmed = all_memories[-self.config.memory_limit :]
             self.memory_store.overwrite(session_id, trimmed)
+            self.memory_index.trim_session(
+                session_id,
+                {str(item.get("id", "")) for item in trimmed if str(item.get("id", ""))},
+            )
             self.audit_logger.log(
                 session_id,
                 "memory_trim",
@@ -832,6 +1094,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--memory-limit", type=int, default=int(os.getenv("PI_MEMORY_LIMIT", "200")))
     parser.add_argument("--memory-recall-limit", type=int, default=int(os.getenv("PI_MEMORY_RECALL_LIMIT", "5")))
     parser.add_argument("--memory-dir", default=os.getenv("PI_MEMORY_DIR", ".openclaw_pi/memory"))
+    parser.add_argument("--memory-search-backend", default=os.getenv("PI_MEMORY_SEARCH_BACKEND", "sqlite-vec"))
+    parser.add_argument("--memory-embedding-provider", default=os.getenv("PI_MEMORY_EMBEDDING_PROVIDER", "auto"))
+    parser.add_argument("--memory-embedding-model", default=os.getenv("PI_MEMORY_EMBEDDING_MODEL", "text-embedding-3-small"))
     return parser.parse_args(argv)
 
 
@@ -851,6 +1116,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         memory_limit=max(1, args.memory_limit),
         memory_recall_limit=max(1, args.memory_recall_limit),
         memory_dir=args.memory_dir,
+        memory_search_backend=args.memory_search_backend,
+        memory_embedding_provider=args.memory_embedding_provider,
+        memory_embedding_model=args.memory_embedding_model,
     )
     agent = OpenClawPiLangChain(config)
     result = agent.run(

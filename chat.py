@@ -90,6 +90,9 @@ def main():
         memory_dir=os.getenv("PI_MEMORY_DIR", ".openclaw_pi/memory"),
         memory_limit=max(1, _safe_int_env("PI_MEMORY_LIMIT", 200)),
         memory_recall_limit=max(1, _safe_int_env("PI_MEMORY_RECALL_LIMIT", 5)),
+        memory_search_backend=os.getenv("PI_MEMORY_SEARCH_BACKEND", "sqlite-vec"),
+        memory_embedding_provider=os.getenv("PI_MEMORY_EMBEDDING_PROVIDER", "auto"),
+        memory_embedding_model=os.getenv("PI_MEMORY_EMBEDDING_MODEL", "text-embedding-3-small"),
     )
     
     try:
