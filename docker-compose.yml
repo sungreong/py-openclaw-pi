@@ -1,0 +1,16 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: python_ubuntu_dev
+    volumes:
+      - .:/app
+    working_dir: /app
+    # 터미널 접속 및 백그라운드 유지를 위한 설정
+    tty: true
+    stdin_open: true
+    command: tail -f /dev/null
+    # .env 파일로 환경 변수 주입
+    env_file:
+      - .env

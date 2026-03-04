@@ -1,0 +1,16 @@
+# Environments
+.env
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.pyc
+
+# Agent Storage
+.openclaw_pi/
+
+# IDE
+.idea/
+.vscode/
