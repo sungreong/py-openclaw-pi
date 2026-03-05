@@ -40,6 +40,13 @@ def _safe_int_env(name: str, default: int) -> int:
         return default
 
 
+def _safe_csv_env(name: str, default: list[str]) -> list[str]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
 class ColoredChatCallbacks(PiCallbacks):
     """
     터미널에서 툴 실행 상태와 AI 응답을 색깔로 예쁘게 구분하여 보여주는 커스텀 콜백
@@ -87,12 +94,17 @@ def main():
         allow_shell=os.getenv("PI_NO_SHELL", "false").lower() == "false",
         enable_compaction=os.getenv("PI_NO_COMPACTION", "false").lower() == "false",
         enable_memory=os.getenv("PI_NO_MEMORY", "false").lower() == "false",
-        memory_dir=os.getenv("PI_MEMORY_DIR", ".openclaw_pi/memory"),
+        memory_mode=os.getenv("PI_MEMORY_MODE", "openclaw"),
+        memory_dir=os.getenv("PI_MEMORY_DIR", ".openclaw/memory"),
         memory_limit=max(1, _safe_int_env("PI_MEMORY_LIMIT", 200)),
         memory_recall_limit=max(1, _safe_int_env("PI_MEMORY_RECALL_LIMIT", 5)),
         memory_search_backend=os.getenv("PI_MEMORY_SEARCH_BACKEND", "sqlite-vec"),
         memory_embedding_provider=os.getenv("PI_MEMORY_EMBEDDING_PROVIDER", "auto"),
         memory_embedding_model=os.getenv("PI_MEMORY_EMBEDDING_MODEL", "text-embedding-3-small"),
+        blocked_paths=_safe_csv_env(
+            "PI_BLOCKED_PATHS",
+            [".env", ".git/**", ".openclaw/memory/**", "secrets/**", "private/**", "node_modules/**"],
+        ),
     )
     
     try:

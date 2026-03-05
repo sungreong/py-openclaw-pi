@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import json
 import math
@@ -13,6 +14,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, Protocol, Sequence
 
@@ -34,6 +36,20 @@ def _now_ts() -> float:
     return time.time()
 
 
+DEFAULT_BLOCKED_PATHS = (
+    ".env",
+    ".git/**",
+    ".openclaw/memory/**",
+    "secrets/**",
+    "private/**",
+    "node_modules/**",
+)
+
+
+def _split_csv(raw: str) -> list[str]:
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
 @dataclass(slots=True)
 class PiAgentConfig:
     model: str = "gpt-5"
@@ -51,12 +67,14 @@ class PiAgentConfig:
     compaction_model: Optional[str] = None
     enable_compaction: bool = True
     enable_memory: bool = True
-    memory_dir: str = ".openclaw_pi/memory"
+    memory_mode: str = "openclaw"
+    memory_dir: str = ".openclaw/memory"
     memory_limit: int = 200
     memory_recall_limit: int = 5
     memory_search_backend: str = "sqlite-vec"
     memory_embedding_provider: str = "auto"
     memory_embedding_model: str = "text-embedding-3-small"
+    blocked_paths: list[str] = field(default_factory=lambda: list(DEFAULT_BLOCKED_PATHS))
 
     def workspace_path(self) -> Path:
         return Path(self.workspace_dir).resolve()
@@ -126,8 +144,47 @@ class ConsoleCallbacks(NullCallbacks):
 
 
 class WorkspaceGuard:
-    def __init__(self, workspace_dir: Path):
+    def __init__(self, workspace_dir: Path, blocked_paths: Optional[Sequence[str]] = None):
         self.workspace_dir = workspace_dir.resolve()
+        patterns = list(blocked_paths or [])
+        self.blocked_patterns = [self._normalize_pattern(p) for p in patterns if self._normalize_pattern(p)]
+
+    @staticmethod
+    def _normalize_pattern(raw: str) -> str:
+        text = str(raw or "").strip().replace("\\", "/")
+        while text.startswith("./"):
+            text = text[2:]
+        text = text.strip("/")
+        return text.lower()
+
+    @staticmethod
+    def _normalize_relpath(raw: str) -> str:
+        text = str(raw or "").replace("\\", "/")
+        while text.startswith("./"):
+            text = text[2:]
+        text = text.strip("/")
+        return text.lower()
+
+    def is_blocked(self, resolved_path: Path) -> bool:
+        try:
+            rel = resolved_path.relative_to(self.workspace_dir).as_posix()
+        except ValueError:
+            return True
+        rel_norm = self._normalize_relpath(rel)
+        if not rel_norm:
+            rel_norm = "."
+        for pattern in self.blocked_patterns:
+            if fnmatch.fnmatch(rel_norm, pattern):
+                return True
+            if pattern.endswith("/**"):
+                root = pattern[:-3].rstrip("/")
+                if rel_norm == root or rel_norm.startswith(root + "/"):
+                    return True
+        return False
+
+    def assert_allowed(self, resolved_path: Path) -> None:
+        if self.is_blocked(resolved_path):
+            raise ValueError(f"blocked path by policy: {resolved_path.relative_to(self.workspace_dir)}")
 
     def resolve(self, raw_path: str) -> Path:
         candidate = Path(raw_path)
@@ -138,6 +195,7 @@ class WorkspaceGuard:
             resolved.relative_to(self.workspace_dir)
         except ValueError as exc:
             raise ValueError(f"Path escapes workspace: {raw_path}") from exc
+        self.assert_allowed(resolved)
         return resolved
 
 
@@ -251,6 +309,134 @@ class FlatMemoryStore:
             for memory in memories:
                 fp.write(json.dumps(memory, ensure_ascii=False) + "\n")
         return path
+
+
+class OpenClawMarkdownMemoryStore:
+    def __init__(self, root: Path):
+        self.root = root
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.index_file = self.root / "MEMORY.md"
+        self._ensure_index_file()
+
+    def _ensure_index_file(self) -> None:
+        if self.index_file.exists():
+            return
+        self.index_file.write_text(
+            "# Memory Index\n\n"
+            "This file summarizes key long-term memories.\n"
+            "Detailed entries are stored in daily files (YYYY-MM-DD.md).\n\n"
+            "## Entries\n",
+            encoding="utf-8",
+        )
+
+    def _daily_file(self, ts: Optional[datetime] = None) -> Path:
+        point = ts or datetime.now(timezone.utc)
+        return self.root / f"{point.strftime('%Y-%m-%d')}.md"
+
+    def _new_memory_id(self, session_id: str, content: str) -> str:
+        raw = f"{session_id}:{content}:{time.time()}".encode("utf-8")
+        short = hashlib.sha1(raw).hexdigest()[:8]
+        return f"mem-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{short}"
+
+    def _iter_daily_files(self) -> list[Path]:
+        rows = [path for path in self.root.glob("*.md") if path.is_file() and path.name != "MEMORY.md"]
+        return sorted(rows, key=lambda p: p.name, reverse=True)
+
+    def _parse_entries_from_file(self, path: Path) -> list[dict[str, Any]]:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        heading_re = re.compile(r"^####\s+(mem-[\w-]+)\s*$", flags=re.MULTILINE)
+        matches = list(heading_re.finditer(text))
+        entries: list[dict[str, Any]] = []
+        for i, match in enumerate(matches):
+            start = match.end()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+            block = text[start:end].strip()
+            memory_id = match.group(1)
+            ts_match = re.search(r"^- Timestamp:\s*(.+)$", block, flags=re.MULTILINE)
+            tags_match = re.search(r"^- Tags:\s*(.+)$", block, flags=re.MULTILINE)
+            session_match = re.search(r"^- Session:\s*(.+)$", block, flags=re.MULTILINE)
+            content_match = re.search(r"^- Content:\s*\n(.+)$", block, flags=re.MULTILINE | re.DOTALL)
+            content = content_match.group(1).strip() if content_match else block
+            if not content.strip():
+                continue
+            tags = [x.strip() for x in (tags_match.group(1).strip() if tags_match else "").split(",") if x.strip()]
+            entries.append(
+                {
+                    "id": memory_id,
+                    "timestamp": ts_match.group(1).strip() if ts_match else "",
+                    "tags": tags,
+                    "session_id": session_match.group(1).strip() if session_match else "",
+                    "content": content.strip(),
+                    "file": path.name,
+                }
+            )
+        return entries
+
+    def append(self, session_id: str, content: str, tags: Optional[Sequence[str]] = None) -> dict[str, Any]:
+        normalized = content.strip()
+        if not normalized:
+            raise ValueError("memory content cannot be empty")
+        timestamp = datetime.now(timezone.utc)
+        memory_id = self._new_memory_id(session_id, normalized)
+        daily_file = self._daily_file(timestamp)
+        safe_tags = [str(tag).strip() for tag in (tags or []) if str(tag).strip()]
+        body = (
+            f"#### {memory_id}\n"
+            f"- Timestamp: {timestamp.isoformat()}\n"
+            f"- Tags: {', '.join(safe_tags) if safe_tags else '-'}\n"
+            f"- Session: {session_id}\n"
+            "- Content:\n"
+            f"{normalized}\n\n"
+        )
+        with daily_file.open("a", encoding="utf-8") as fp:
+            fp.write(body)
+
+        snippet = re.sub(r"\s+", " ", normalized)
+        if len(snippet) > 120:
+            snippet = snippet[:117] + "..."
+        with self.index_file.open("a", encoding="utf-8") as fp:
+            fp.write(
+                f"- {memory_id} | {daily_file.name} | tags={','.join(safe_tags) if safe_tags else '-'} | {snippet}\n"
+            )
+        return {
+            "id": memory_id,
+            "timestamp": timestamp.isoformat(),
+            "tags": safe_tags,
+            "session_id": session_id,
+            "content": normalized,
+            "file": daily_file.name,
+        }
+
+    def search(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+        needle = query.strip().lower()
+        if not needle:
+            return []
+        terms = [x for x in re.split(r"\s+", needle) if x]
+        if not terms:
+            return []
+        scored: list[dict[str, Any]] = []
+        for file_path in self._iter_daily_files():
+            for entry in self._parse_entries_from_file(file_path):
+                haystack = " ".join(
+                    [str(entry.get("content", "")), " ".join(entry.get("tags", [])), str(entry.get("session_id", ""))]
+                ).lower()
+                score = sum(haystack.count(term) for term in terms)
+                if score > 0:
+                    scored.append({**entry, "score": score})
+        scored.sort(key=lambda x: (int(x.get("score", 0)), str(x.get("timestamp", ""))), reverse=True)
+        return scored[: max(1, int(limit))]
+
+    def get_by_ids(self, ids: Sequence[str]) -> list[dict[str, Any]]:
+        wanted = {x.strip() for x in ids if x.strip()}
+        if not wanted:
+            return []
+        found: list[dict[str, Any]] = []
+        for file_path in self._iter_daily_files():
+            for entry in self._parse_entries_from_file(file_path):
+                if entry.get("id") in wanted:
+                    found.append(entry)
+        found.sort(key=lambda x: str(x.get("timestamp", "")), reverse=True)
+        return found
 
 
 class MemoryEmbeddingClient:
@@ -499,15 +685,17 @@ class OpenClawPiLangChain:
         self.config = config
         self.workspace_dir = config.workspace_path()
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
-        self.guard = WorkspaceGuard(self.workspace_dir)
+        self.guard = WorkspaceGuard(self.workspace_dir, config.blocked_paths)
         self.session_store = FlatSessionStore(config.session_root())
         self.audit_logger = AuditLogger(config.audit_root())
         self.memory_store = FlatMemoryStore(config.memory_root())
+        self.markdown_memory_store = OpenClawMarkdownMemoryStore(config.memory_root())
         self.memory_index = SqliteVecMemoryIndex(config.memory_root() / "memory_vec.sqlite", self.audit_logger)
         self.embedding_client = MemoryEmbeddingClient(
             provider=config.memory_embedding_provider,
             model=config.memory_embedding_model,
         )
+        self._active_session_id = "main"
 
         self.model = init_chat_model(
             config.model,
@@ -748,6 +936,8 @@ class OpenClawPiLangChain:
                     return f"Error: '{dir_path}' is not a directory."
                 rows: list[str] = []
                 for child in sorted(dir_path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
+                    if guard.is_blocked(child):
+                        continue
                     kind = "dir" if child.is_dir() else "file"
                     rel = child.relative_to(workspace_dir)
                     rows.append(f"[{kind}] {rel}")
@@ -759,9 +949,14 @@ class OpenClawPiLangChain:
         def find(glob: str = "**/*") -> str:
             """Find files by glob pattern inside the workspace."""
             try:
+                static_prefix = re.split(r"[\*\?\[]", glob, maxsplit=1)[0].strip()
+                if static_prefix:
+                    guard.resolve(static_prefix)
                 rows = []
                 for path in sorted(workspace_dir.glob(glob)):
                     if path.name.startswith(".git"):
+                        continue
+                    if guard.is_blocked(path):
                         continue
                     if path.is_file():
                         rows.append(str(path.relative_to(workspace_dir)))
@@ -787,6 +982,8 @@ class OpenClawPiLangChain:
                     files = sorted(p for p in base.rglob("*") if p.is_file())
                 
                 for file_path in files:
+                    if guard.is_blocked(file_path):
+                        continue
                     rel = file_path.relative_to(workspace_dir)
                     try:
                         text = file_path.read_text(encoding="utf-8", errors="replace")
@@ -850,7 +1047,79 @@ class OpenClawPiLangChain:
             except Exception as e:
                 return f"Error executing command '{command}': {e}"
 
-        return [read, write, edit, ls, find, grep, exec_tool]
+        @tool("memory_search")
+        def memory_search(query: str, limit: int = 5) -> str:
+            """Search memory and return matching memory IDs and snippets."""
+            if not self.config.enable_memory:
+                return "Memory is disabled."
+            if (self.config.memory_mode or "").strip().lower() != "openclaw":
+                return "memory_search is only available when PI_MEMORY_MODE=openclaw."
+            try:
+                rows = self.markdown_memory_store.search(query=query, limit=max(1, int(limit)))
+                if not rows:
+                    return "No memory matches."
+                out: list[str] = []
+                for row in rows:
+                    snippet = re.sub(r"\s+", " ", str(row.get("content", "")).strip())
+                    if len(snippet) > 140:
+                        snippet = snippet[:137] + "..."
+                    out.append(
+                        f"- id={row.get('id')} score={row.get('score')} file={row.get('file')} tags={','.join(row.get('tags', [])) or '-'} :: {snippet}"
+                    )
+                return "\n".join(out)
+            except Exception as e:
+                return f"Error searching memory: {e}"
+
+        @tool("memory_get")
+        def memory_get(ids: str) -> str:
+            """Get full memory entries by IDs. Input: comma or whitespace separated IDs."""
+            if not self.config.enable_memory:
+                return "Memory is disabled."
+            if (self.config.memory_mode or "").strip().lower() != "openclaw":
+                return "memory_get is only available when PI_MEMORY_MODE=openclaw."
+            try:
+                parsed_ids = [x for x in re.split(r"[\s,]+", ids or "") if x.strip()]
+                rows = self.markdown_memory_store.get_by_ids(parsed_ids)
+                if not rows:
+                    return "No memory entries found for the requested IDs."
+                blocks: list[str] = []
+                for row in rows:
+                    blocks.append(
+                        "\n".join(
+                            [
+                                f"ID: {row.get('id')}",
+                                f"Timestamp: {row.get('timestamp')}",
+                                f"File: {row.get('file')}",
+                                f"Tags: {', '.join(row.get('tags', [])) or '-'}",
+                                f"Session: {row.get('session_id') or '-'}",
+                                "Content:",
+                                str(row.get("content", "")),
+                            ]
+                        )
+                    )
+                return "\n\n---\n\n".join(blocks)
+            except Exception as e:
+                return f"Error getting memory entries: {e}"
+
+        @tool("memory_store")
+        def memory_store(content: str, tags: str = "") -> str:
+            """Store a memory entry in OpenClaw markdown memory files."""
+            if not self.config.enable_memory:
+                return "Memory is disabled."
+            if (self.config.memory_mode or "").strip().lower() != "openclaw":
+                return "memory_store is only available when PI_MEMORY_MODE=openclaw."
+            try:
+                tag_list = [x.strip() for x in re.split(r"[\s,]+", tags or "") if x.strip()]
+                entry = self.markdown_memory_store.append(
+                    session_id=self._active_session_id,
+                    content=content,
+                    tags=tag_list,
+                )
+                return f"Stored memory {entry['id']} in {entry['file']}"
+            except Exception as e:
+                return f"Error storing memory entry: {e}"
+
+        return [read, write, edit, ls, find, grep, exec_tool, memory_search, memory_get, memory_store]
 
     def _filter_tools(
         self,
@@ -874,6 +1143,21 @@ class OpenClawPiLangChain:
             tool_lines.append(f"- {tool_obj.name}: {description}")
 
         tool_block = "\n".join(tool_lines)
+        
+        memory_status = (
+            "Memory system: ENABLED."
+            if self.config.enable_memory
+            else "Memory system: DISABLED - Conversations are not persisted across sessions."
+        )
+        if self.config.enable_memory:
+            memory_mode = (self.config.memory_mode or "").strip().lower()
+            if memory_mode == "openclaw":
+                memory_status += (
+                    " OpenClaw mode active. Use memory_search -> memory_get -> memory_store."
+                )
+            else:
+                memory_status += " Legacy mode active. Automatic memory recall/write is enabled."
+        
         return (
             "You are Pi, a minimal coding agent inspired by OpenClaw's embedded Pi runtime.\n\n"
             "Behavior rules:\n"
@@ -883,8 +1167,10 @@ class OpenClawPiLangChain:
             "4. Stay inside the workspace unless the user explicitly expands scope.\n"
             "5. After tool use, summarize what you learned or changed.\n"
             "6. If a shell command fails, inspect the error and retry only when there is a clear fix.\n\n"
+            "Policy: Sensitive/blocked paths are never accessed by generic file tools.\n\n"
             f"Workspace: {self.workspace_dir}\n"
-            f"Session ID: {session_id}\n\n"
+            f"Session ID: {session_id}\n"
+            f"{memory_status}\n\n"
             "Available tools:\n"
             f"{tool_block}"
         )
@@ -960,6 +1246,7 @@ class OpenClawPiLangChain:
         denylist: Optional[Sequence[str]] = None,
     ) -> PiRunResult:
         callbacks = callbacks or NullCallbacks()
+        self._active_session_id = session_id
         tools = self._filter_tools(allowlist=allowlist, denylist=denylist)
         system_prompt = self._build_system_prompt(tools, session_id=session_id)
         agent = self._create_agent(tools=tools, system_prompt=system_prompt)
@@ -969,7 +1256,10 @@ class OpenClawPiLangChain:
         self.session_store.save(session_id, history)
 
         self.audit_logger.log(session_id, "user_prompt", {"text": prompt})
-        recalled = self._recall_memories(session_id=session_id, prompt=prompt)
+        mode = (self.config.memory_mode or "").strip().lower()
+        recalled: list[dict[str, Any]] = []
+        if mode != "openclaw":
+            recalled = self._recall_memories(session_id=session_id, prompt=prompt)
         memory_message = self._memory_context_message(recalled)
 
         input_messages = [*history]
@@ -1064,7 +1354,8 @@ class OpenClawPiLangChain:
             "assistant_final",
             {"text": final_text, "tool_calls": len(tool_calls), "tool_results": len(tool_results)},
         )
-        self._write_memories(session_id=session_id, prompt=prompt, final_text=final_text)
+        if mode != "openclaw":
+            self._write_memories(session_id=session_id, prompt=prompt, final_text=final_text)
 
         return PiRunResult(
             session_id=session_id,
@@ -1077,6 +1368,8 @@ class OpenClawPiLangChain:
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="OpenClaw Pi-like agent rebuilt with LangChain")
+    env_blocked = _split_csv(os.getenv("PI_BLOCKED_PATHS", ""))
+    default_blocked = env_blocked or list(DEFAULT_BLOCKED_PATHS)
     parser.add_argument("prompt", help="user prompt")
     parser.add_argument("--model", default=os.getenv("PI_MODEL", "gpt-4o"))
     parser.add_argument("--workspace", default=os.getenv("PI_WORKSPACE", "."))
@@ -1091,12 +1384,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--no-shell", action="store_true", default=os.getenv("PI_NO_SHELL", "false").lower() == "true")
     parser.add_argument("--no-compaction", action="store_true", default=os.getenv("PI_NO_COMPACTION", "false").lower() == "true")
     parser.add_argument("--no-memory", action="store_true", default=os.getenv("PI_NO_MEMORY", "false").lower() == "true")
+    parser.add_argument("--memory-mode", default=os.getenv("PI_MEMORY_MODE", "openclaw"))
     parser.add_argument("--memory-limit", type=int, default=int(os.getenv("PI_MEMORY_LIMIT", "200")))
     parser.add_argument("--memory-recall-limit", type=int, default=int(os.getenv("PI_MEMORY_RECALL_LIMIT", "5")))
-    parser.add_argument("--memory-dir", default=os.getenv("PI_MEMORY_DIR", ".openclaw_pi/memory"))
+    parser.add_argument("--memory-dir", default=os.getenv("PI_MEMORY_DIR", ".openclaw/memory"))
     parser.add_argument("--memory-search-backend", default=os.getenv("PI_MEMORY_SEARCH_BACKEND", "sqlite-vec"))
     parser.add_argument("--memory-embedding-provider", default=os.getenv("PI_MEMORY_EMBEDDING_PROVIDER", "auto"))
     parser.add_argument("--memory-embedding-model", default=os.getenv("PI_MEMORY_EMBEDDING_MODEL", "text-embedding-3-small"))
+    parser.add_argument("--blocked-path", action="append", default=default_blocked)
     return parser.parse_args(argv)
 
 
@@ -1113,12 +1408,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         allow_shell=not args.no_shell,
         enable_compaction=not args.no_compaction,
         enable_memory=not args.no_memory,
+        memory_mode=args.memory_mode,
         memory_limit=max(1, args.memory_limit),
         memory_recall_limit=max(1, args.memory_recall_limit),
         memory_dir=args.memory_dir,
         memory_search_backend=args.memory_search_backend,
         memory_embedding_provider=args.memory_embedding_provider,
         memory_embedding_model=args.memory_embedding_model,
+        blocked_paths=[x for x in (args.blocked_path or []) if str(x).strip()],
     )
     agent = OpenClawPiLangChain(config)
     result = agent.run(
