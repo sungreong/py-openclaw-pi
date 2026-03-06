@@ -11,6 +11,52 @@ Minimal coding agent runtime inspired by OpenClaw.
    - CLI: `python openclaw_pi_langchain.py "your prompt"`
    - Chat: `python chat.py`
 
+## Multi-Agent Session Examples
+
+Use different `PI_SESSION` values to separate each agent's context and history.
+
+### 1) Code analysis agent (read-only)
+
+```powershell
+python openclaw_pi_langchain.py "코드 구조를 요약하고 리스크 3개를 찾아줘" `
+  --session analyst `
+  --deny-tool write `
+  --deny-tool edit `
+  --deny-tool exec
+```
+
+### 2) Runner agent (execute only)
+
+```powershell
+python openclaw_pi_langchain.py "테스트 실행하고 실패 원인 요약해줘" `
+  --session runner `
+  --allow-tool ls `
+  --allow-tool find `
+  --allow-tool grep `
+  --allow-tool read `
+  --allow-tool exec
+```
+
+### 3) Fixer agent (edit + validate)
+
+```powershell
+python openclaw_pi_langchain.py "실패 테스트를 최소 수정으로 고치고 검증해줘" `
+  --session fixer
+```
+
+### 4) Interactive chat per role
+
+```powershell
+$env:PI_SESSION="analyst"; python chat.py
+$env:PI_SESSION="runner"; python chat.py
+$env:PI_SESSION="fixer"; python chat.py
+```
+
+Recommended workflow:
+1. `analyst` finds issue scope
+2. `runner` reproduces with commands
+3. `fixer` applies patch and re-validates
+
 ## Memory Modes
 
 - `PI_MEMORY_MODE=openclaw` (default)
