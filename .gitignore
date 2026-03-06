@@ -15,3 +15,6 @@ ai_docs
 # IDE
 .idea/
 .vscode/
+
+sample/result/*
+sample/*.py

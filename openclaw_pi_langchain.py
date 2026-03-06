@@ -74,6 +74,13 @@ class PiAgentConfig:
     memory_search_backend: str = "sqlite-vec"
     memory_embedding_provider: str = "auto"
     memory_embedding_model: str = "text-embedding-3-small"
+    enable_exec_path_correction: bool = False
+    read_strategy: str = "smart"
+    read_small_line_limit: int = 400
+    read_small_char_limit: int = 16384
+    read_preview_head_lines: int = 120
+    read_preview_tail_lines: int = 80
+    read_output_budget_chars: int = 20000
     blocked_paths: list[str] = field(default_factory=lambda: list(DEFAULT_BLOCKED_PATHS))
 
     def workspace_path(self) -> Path:
@@ -696,6 +703,10 @@ class OpenClawPiLangChain:
             model=config.memory_embedding_model,
         )
         self._active_session_id = "main"
+        self._session_exec_failure_keys: dict[str, set[str]] = {}
+        self._session_exec_failure_recent: dict[str, list[dict[str, Any]]] = {}
+        self._session_mutation_ticks: dict[str, int] = {}
+        self._session_turn_read_chars: dict[str, int] = {}
 
         self.model = init_chat_model(
             config.model,
@@ -712,6 +723,232 @@ class OpenClawPiLangChain:
         if extra_tools:
             tools.extend(extra_tools)
         self.all_tools = tools
+
+    def _normalize_command(self, command: str) -> str:
+        return re.sub(r"\s+", " ", str(command or "").strip())
+
+    def _effective_read_strategy(self) -> str:
+        strategy = str(self.config.read_strategy or "smart").strip().lower()
+        return strategy if strategy in {"smart", "legacy"} else "smart"
+
+    def _read_budget_used(self, session_id: str) -> int:
+        return int(self._session_turn_read_chars.get(str(session_id or "main"), 0))
+
+    def _reset_read_budget(self, session_id: str) -> None:
+        self._session_turn_read_chars[str(session_id or "main")] = 0
+
+    def _clear_read_budget(self, session_id: str) -> None:
+        self._session_turn_read_chars.pop(str(session_id or "main"), None)
+
+    def _consume_read_budget(self, session_id: str, amount: int) -> int:
+        key = str(session_id or "main")
+        used = int(self._session_turn_read_chars.get(key, 0))
+        used += max(0, int(amount))
+        self._session_turn_read_chars[key] = used
+        return used
+
+    def _read_budget_guard_message(self, used: int) -> str:
+        limit = max(1, int(self.config.read_output_budget_chars))
+        return (
+            f"read budget exceeded for this turn (used={used}, limit={limit}). "
+            "Use grep/find to narrow lines first, then retry read for targeted content."
+        )
+
+    def _smart_read_output(self, rel_path: Path, text: str, full: bool) -> str:
+        strategy = self._effective_read_strategy()
+        if full or strategy == "legacy":
+            return _shorten(text)
+
+        char_count = len(text)
+        lines = text.splitlines()
+        line_count = len(lines)
+        if char_count <= int(self.config.read_small_char_limit) or line_count <= int(self.config.read_small_line_limit):
+            return _shorten(text)
+
+        head_n = max(1, int(self.config.read_preview_head_lines))
+        tail_n = max(1, int(self.config.read_preview_tail_lines))
+        head = "\n".join(lines[:head_n])
+        tail = "\n".join(lines[-tail_n:]) if line_count > tail_n else "\n".join(lines)
+        preview = (
+            f"path={rel_path.as_posix()}\n"
+            f"line_count={line_count}\n"
+            f"char_count={char_count}\n"
+            "truncated=true\n"
+            "hint=use grep for target lines, then read(path, full=true) for full content\n\n"
+            f"--- head (first {head_n} lines) ---\n"
+            f"{head}\n\n"
+            f"--- tail (last {tail_n} lines) ---\n"
+            f"{tail}"
+        )
+        return _shorten(preview)
+
+    def _core_stderr_line(self, stderr: str) -> str:
+        for line in reversed((stderr or "").splitlines()):
+            cleaned = re.sub(r"\s+", " ", line.strip())
+            if cleaned:
+                return cleaned[:240]
+        return "-"
+
+    def _exec_error_type(self, exit_code: int, stderr: str) -> str:
+        if int(exit_code) == 0:
+            return "-"
+        lower = (stderr or "").lower()
+        if "no such file or directory" in lower or "can't open file" in lower:
+            return "FILE_NOT_FOUND"
+        if "permission denied" in lower:
+            return "PERMISSION_DENIED"
+        if "command not found" in lower or "is not recognized as an internal or external command" in lower:
+            return "COMMAND_NOT_FOUND"
+        return "COMMAND_FAILED"
+
+    def _exec_retryable(self, error_type: str) -> bool:
+        return error_type in {"COMMAND_FAILED"}
+
+    def _exec_failure_signature(self, cwd_rel: str, command: str, stderr: str) -> str:
+        payload = "|".join(
+            [
+                "exec",
+                cwd_rel.strip() or ".",
+                self._normalize_command(command),
+                self._core_stderr_line(stderr),
+            ]
+        )
+        return hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+    def _session_failure_key_set(self, session_id: str) -> set[str]:
+        key = str(session_id or "main")
+        if key not in self._session_exec_failure_keys:
+            self._session_exec_failure_keys[key] = set()
+        return self._session_exec_failure_keys[key]
+
+    def _session_failure_recent(self, session_id: str) -> list[dict[str, Any]]:
+        key = str(session_id or "main")
+        if key not in self._session_exec_failure_recent:
+            self._session_exec_failure_recent[key] = []
+        return self._session_exec_failure_recent[key]
+
+    def _session_mutation_tick(self, session_id: str) -> int:
+        key = str(session_id or "main")
+        return int(self._session_mutation_ticks.get(key, 0))
+
+    def _bump_session_mutation_tick(self, session_id: str) -> int:
+        key = str(session_id or "main")
+        next_tick = self._session_mutation_tick(key) + 1
+        self._session_mutation_ticks[key] = next_tick
+        return next_tick
+
+    def _remember_exec_failure(
+        self,
+        session_id: str,
+        *,
+        cwd_rel: str,
+        command: str,
+        error_type: str,
+        error_signature: str,
+        stderr_core: str,
+    ) -> None:
+        mutation_tick = self._session_mutation_tick(session_id)
+        dedup_key = f"exec|{cwd_rel}|{self._normalize_command(command)}|{error_signature}|t={mutation_tick}"
+        self._session_failure_key_set(session_id).add(dedup_key)
+        recent = self._session_failure_recent(session_id)
+        recent.append(
+            {
+                "tool": "exec",
+                "cwd": cwd_rel,
+                "command": self._normalize_command(command),
+                "error_type": error_type,
+                "error_signature": error_signature,
+                "stderr_core": stderr_core,
+                "mutation_tick": mutation_tick,
+                "ts": _now_ts(),
+            }
+        )
+        if len(recent) > 30:
+            del recent[: len(recent) - 30]
+
+    def _is_duplicate_exec_failure(self, session_id: str, cwd_rel: str, command: str) -> Optional[dict[str, str]]:
+        normalized_command = self._normalize_command(command)
+        current_tick = self._session_mutation_tick(session_id)
+        recent = self._session_failure_recent(session_id)
+        for item in reversed(recent):
+            if item.get("cwd") != cwd_rel:
+                continue
+            if item.get("command") != normalized_command:
+                continue
+            if int(item.get("mutation_tick", -1)) != current_tick:
+                continue
+            sig = str(item.get("error_signature", "")).strip()
+            dedup_key = f"exec|{cwd_rel}|{normalized_command}|{sig}|t={current_tick}"
+            if sig and dedup_key in self._session_failure_key_set(session_id):
+                return {
+                    "error_signature": sig,
+                    "error_type": str(item.get("error_type", "COMMAND_FAILED")),
+                    "stderr_core": str(item.get("stderr_core", "-")),
+                }
+        return None
+
+    def _parse_exec_meta(self, content: str) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for raw in (content or "").splitlines():
+            if "=" not in raw:
+                continue
+            key, value = raw.split("=", 1)
+            key = key.strip()
+            if key in {"result", "error_type", "error_signature", "retryable"}:
+                out[key] = value.strip()
+        return out
+
+    def _failure_digest_message(self, session_id: str, limit: int = 3) -> Optional[dict[str, str]]:
+        recent = self._session_failure_recent(session_id)
+        if not recent:
+            return None
+        rows = recent[-max(1, int(limit)) :]
+        lines: list[str] = []
+        for item in rows:
+            lines.append(
+                f"- exec cwd={item.get('cwd')} cmd={item.get('command')} "
+                f"type={item.get('error_type')} sig={item.get('error_signature')} "
+                f"stderr={item.get('stderr_core')}"
+            )
+        return {
+            "role": "system",
+            "content": (
+                "Failure Digest (recent exec failures):\n"
+                + "\n".join(lines)
+                + "\nAvoid repeating the same exec. Prefer read/ls/find/grep to verify paths and files first."
+            ),
+        }
+
+    def _maybe_correct_exec_command(self, command: str, run_dir: Path) -> tuple[str, Optional[str]]:
+        if not self.config.enable_exec_path_correction:
+            return command, None
+        parts = re.split(r"\s+", str(command or "").strip())
+        if len(parts) < 2:
+            return command, None
+        launcher = parts[0].lower()
+        if launcher not in {"python", "python3", "py"}:
+            return command, None
+        script = parts[1].strip().strip("\"'")
+        if not script:
+            return command, None
+        script_path = Path(script.replace("\\", "/"))
+        if script_path.is_absolute():
+            return command, None
+        candidate_now = (run_dir / script_path).resolve()
+        if candidate_now.exists():
+            return command, None
+        script_parts = list(script_path.parts)
+        if len(script_parts) < 2:
+            return command, None
+        if script_parts[0] != run_dir.name:
+            return command, None
+        corrected_script = "/".join(script_parts[1:])
+        corrected = " ".join([parts[0], corrected_script, *parts[2:]])
+        corrected_candidate = (run_dir / corrected_script).resolve()
+        if not corrected_candidate.exists():
+            return command, None
+        note = f"exec path correction applied: {script} -> {corrected_script}"
+        return corrected, note
 
     def _normalize_memory_text(self, text: str) -> str:
         return re.sub(r"\s+", " ", text.strip().lower())
@@ -881,15 +1118,28 @@ class OpenClawPiLangChain:
         allow_shell = self.config.allow_shell
 
         @tool("read")
-        def read(path: str) -> str:
-            """Read a UTF-8 text file from the workspace."""
+        def read(path: str, full: bool = False) -> str:
+            """Read a UTF-8 text file. Large files default to head/tail preview unless full=true."""
             try:
                 file_path = guard.resolve(path)
                 if not file_path.exists():
                     return f"Error: File '{file_path}' not found."
                 if file_path.is_dir():
                     return f"Error: '{file_path}' is a directory, not a file."
-                return _shorten(file_path.read_text(encoding="utf-8", errors="replace"))
+                session_id = str(self._active_session_id or "main")
+                used = self._read_budget_used(session_id)
+                limit = max(1, int(self.config.read_output_budget_chars))
+                if used >= limit:
+                    return self._read_budget_guard_message(used=used)
+
+                text = file_path.read_text(encoding="utf-8", errors="replace")
+                output = self._smart_read_output(
+                    rel_path=file_path.relative_to(workspace_dir),
+                    text=text,
+                    full=bool(full),
+                )
+                self._consume_read_budget(session_id, len(output))
+                return output
             except Exception as e:
                 return f"Error reading file '{path}': {e}"
 
@@ -902,6 +1152,7 @@ class OpenClawPiLangChain:
                 file_path = guard.resolve(path)
                 file_path.parent.mkdir(parents=True, exist_ok=True)
                 file_path.write_text(content, encoding="utf-8")
+                self._bump_session_mutation_tick(self._active_session_id)
                 return f"wrote {len(content)} chars to {file_path.relative_to(workspace_dir)}"
             except Exception as e:
                 return f"Error writing file '{path}': {e}"
@@ -921,6 +1172,7 @@ class OpenClawPiLangChain:
                     return f"Error: target snippet appears {count} times; set replace_all=true to replace all."
                 updated = text.replace(old, new) if replace_all else text.replace(old, new, 1)
                 file_path.write_text(updated, encoding="utf-8")
+                self._bump_session_mutation_tick(self._active_session_id)
                 return f"updated {file_path.relative_to(workspace_dir)}; replacements={count if replace_all else 1}"
             except Exception as e:
                 return f"Error editing file '{path}': {e}"
@@ -966,7 +1218,7 @@ class OpenClawPiLangChain:
 
         @tool("grep")
         def grep(pattern: str, path: str = ".") -> str:
-            """Search for a regex pattern in text files inside the workspace."""
+            """Search regex matches first to target line ranges before reading large files."""
             try:
                 base = guard.resolve(path)
                 try:
@@ -1008,6 +1260,29 @@ class OpenClawPiLangChain:
                 run_dir = guard.resolve(cwd)
                 if not run_dir.is_dir():
                     return f"Error: Directory '{run_dir}' not found."
+                cwd_rel = str(run_dir.relative_to(workspace_dir))
+                session_id = str(self._active_session_id or "main")
+
+                duplicate = self._is_duplicate_exec_failure(
+                    session_id=session_id,
+                    cwd_rel=cwd_rel,
+                    command=command,
+                )
+                if duplicate:
+                    blocked_output = (
+                        f"cwd={cwd_rel}\n"
+                        "exit_code=blocked\n"
+                        "stdout:\n\n"
+                        "stderr:\nBlocked duplicate exec failure. "
+                        "Strategy change required: inspect paths/files with read/ls/find/grep before retrying.\n"
+                        "result=error\n"
+                        "error_type=DUPLICATE_FAILURE\n"
+                        f"error_signature={duplicate.get('error_signature', '-')}\n"
+                        "retryable=false"
+                    )
+                    return _shorten(blocked_output, 24000)
+
+                final_command, correction_note = self._maybe_correct_exec_command(command, run_dir)
 
                 writer: Optional[Callable[[str], None]]
                 try:
@@ -1016,11 +1291,13 @@ class OpenClawPiLangChain:
                     writer = None
                 
                 if writer:
-                    writer(f"exec started: {command}")
+                    writer(f"exec started: {final_command}")
+                    if correction_note:
+                        writer(correction_note)
                 
                 try:
                     completed = subprocess.run(
-                        command,
+                        final_command,
                         cwd=str(run_dir),
                         shell=True,
                         text=True,
@@ -1029,12 +1306,33 @@ class OpenClawPiLangChain:
                         encoding="utf-8",
                         errors="replace",
                     )
+                    error_type = self._exec_error_type(completed.returncode, completed.stderr)
+                    result = "ok" if completed.returncode == 0 else "error"
+                    retryable = "true" if (result == "error" and self._exec_retryable(error_type)) else "false"
+                    error_signature = (
+                        self._exec_failure_signature(cwd_rel, final_command, completed.stderr)
+                        if result == "error"
+                        else "-"
+                    )
+                    if result == "error":
+                        self._remember_exec_failure(
+                            session_id,
+                            cwd_rel=cwd_rel,
+                            command=final_command,
+                            error_type=error_type,
+                            error_signature=error_signature,
+                            stderr_core=self._core_stderr_line(completed.stderr),
+                        )
                     
                     output = (
-                        f"cwd={run_dir.relative_to(workspace_dir)}\n"
+                        f"cwd={cwd_rel}\n"
                         f"exit_code={completed.returncode}\n"
                         f"stdout:\n{completed.stdout}\n"
-                        f"stderr:\n{completed.stderr}"
+                        f"stderr:\n{completed.stderr}\n"
+                        f"result={result}\n"
+                        f"error_type={error_type}\n"
+                        f"error_signature={error_signature}\n"
+                        f"retryable={retryable}"
                     )
                     
                     if writer:
@@ -1042,8 +1340,31 @@ class OpenClawPiLangChain:
                     return _shorten(output, 24000)
                 except subprocess.TimeoutExpired:
                     if writer:
-                        writer(f"exec timed out after {timeout_s}s: {command}")
-                    return f"Error: Command timed out after {timeout_s} seconds."
+                        writer(f"exec timed out after {timeout_s}s: {final_command}")
+                    error_signature = self._exec_failure_signature(
+                        cwd_rel,
+                        final_command,
+                        f"timeout after {timeout_s}s",
+                    )
+                    self._remember_exec_failure(
+                        session_id,
+                        cwd_rel=cwd_rel,
+                        command=final_command,
+                        error_type="TIMEOUT",
+                        error_signature=error_signature,
+                        stderr_core=f"timeout after {timeout_s}s",
+                    )
+                    timeout_output = (
+                        f"cwd={cwd_rel}\n"
+                        "exit_code=timeout\n"
+                        "stdout:\n\n"
+                        f"stderr:\nCommand timed out after {timeout_s} seconds.\n"
+                        "result=error\n"
+                        "error_type=TIMEOUT\n"
+                        f"error_signature={error_signature}\n"
+                        "retryable=true"
+                    )
+                    return timeout_output
             except Exception as e:
                 return f"Error executing command '{command}': {e}"
 
@@ -1162,7 +1483,8 @@ class OpenClawPiLangChain:
             "You are Pi, a minimal coding agent inspired by OpenClaw's embedded Pi runtime.\n\n"
             "Behavior rules:\n"
             "1. Use tools instead of guessing.\n"
-            "2. Read files before editing them unless the user explicitly asked for a fresh file.\n"
+            "2. Read files before editing them unless the user explicitly asked for a fresh file. "
+            "For large files, use grep/find first to narrow scope.\n"
             "3. Prefer precise edits over full rewrites when possible.\n"
             "4. Stay inside the workspace unless the user explicitly expands scope.\n"
             "5. After tool use, summarize what you learned or changed.\n"
@@ -1247,6 +1569,7 @@ class OpenClawPiLangChain:
     ) -> PiRunResult:
         callbacks = callbacks or NullCallbacks()
         self._active_session_id = session_id
+        self._reset_read_budget(session_id)
         tools = self._filter_tools(allowlist=allowlist, denylist=denylist)
         system_prompt = self._build_system_prompt(tools, session_id=session_id)
         agent = self._create_agent(tools=tools, system_prompt=system_prompt)
@@ -1265,6 +1588,9 @@ class OpenClawPiLangChain:
         input_messages = [*history]
         if memory_message:
             input_messages.append(memory_message)
+        failure_digest = self._failure_digest_message(session_id=session_id, limit=3)
+        if failure_digest:
+            input_messages.append(failure_digest)
         input_messages.append({"role": "user", "content": prompt})
 
         seen_tool_starts: set[str] = set()
@@ -1330,6 +1656,10 @@ class OpenClawPiLangChain:
                         content = extract_text(message)
                         is_error = str(getattr(message, "status", "")).lower() == "error"
                         name = getattr(message, "name", None) or step_name
+                        if str(name).strip().lower() == "exec":
+                            exec_meta = self._parse_exec_meta(content)
+                            if exec_meta.get("result") == "error":
+                                is_error = True
                         item = {
                             "tool_call_id": tool_call_id,
                             "name": name,
@@ -1356,6 +1686,7 @@ class OpenClawPiLangChain:
         )
         if mode != "openclaw":
             self._write_memories(session_id=session_id, prompt=prompt, final_text=final_text)
+        self._clear_read_budget(session_id)
 
         return PiRunResult(
             session_id=session_id,
@@ -1391,6 +1722,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--memory-search-backend", default=os.getenv("PI_MEMORY_SEARCH_BACKEND", "sqlite-vec"))
     parser.add_argument("--memory-embedding-provider", default=os.getenv("PI_MEMORY_EMBEDDING_PROVIDER", "auto"))
     parser.add_argument("--memory-embedding-model", default=os.getenv("PI_MEMORY_EMBEDDING_MODEL", "text-embedding-3-small"))
+    parser.add_argument("--read-strategy", default=os.getenv("PI_READ_STRATEGY", "smart"))
+    parser.add_argument(
+        "--exec-path-correction",
+        action="store_true",
+        default=os.getenv("PI_EXEC_PATH_CORRECTION", "false").lower() == "true",
+    )
     parser.add_argument("--blocked-path", action="append", default=default_blocked)
     return parser.parse_args(argv)
 
@@ -1415,6 +1752,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         memory_search_backend=args.memory_search_backend,
         memory_embedding_provider=args.memory_embedding_provider,
         memory_embedding_model=args.memory_embedding_model,
+        read_strategy=args.read_strategy,
+        enable_exec_path_correction=args.exec_path_correction,
         blocked_paths=[x for x in (args.blocked_path or []) if str(x).strip()],
     )
     agent = OpenClawPiLangChain(config)

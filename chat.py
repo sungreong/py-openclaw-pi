@@ -84,7 +84,7 @@ def main():
     # 파서 설정을 가져오되, 사용자 프롬프트(prompt) 부분은 필수가 아니도록 수정하거나 무시합니다.
     # 기존 parse_args를 그대로 쓰면 프롬프트가 필수로 들어가므로 직접 세팅합니다.
     config = PiAgentConfig(
-        model=os.getenv("PI_MODEL", "gpt-4o"),
+        model=os.getenv("PI_MODEL", "gpt-4o-mini"),
         workspace_dir=os.getenv("PI_WORKSPACE", "."),
         session_dir=os.getenv("PI_SESSION_DIR", ".openclaw_pi/sessions"),
         audit_dir=os.getenv("PI_AUDIT_DIR", ".openclaw_pi/audit"),
@@ -101,6 +101,8 @@ def main():
         memory_search_backend=os.getenv("PI_MEMORY_SEARCH_BACKEND", "sqlite-vec"),
         memory_embedding_provider=os.getenv("PI_MEMORY_EMBEDDING_PROVIDER", "auto"),
         memory_embedding_model=os.getenv("PI_MEMORY_EMBEDDING_MODEL", "text-embedding-3-small"),
+        read_strategy=os.getenv("PI_READ_STRATEGY", "smart"),
+        enable_exec_path_correction=os.getenv("PI_EXEC_PATH_CORRECTION", "false").lower() == "true",
         blocked_paths=_safe_csv_env(
             "PI_BLOCKED_PATHS",
             [".env", ".git/**", ".openclaw/memory/**", "secrets/**", "private/**", "node_modules/**"],
