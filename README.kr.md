@@ -91,6 +91,7 @@ $env:PI_SESSION="fixer"; python chat.py
 - `PI_WORKSPACE`
 - `PI_SESSION`
 - `PI_MAX_MODEL_CALLS`
+- `PI_TOOL_REPEAT_LIMIT` (기본 `3`; 동일 툴 호출이 한 실행에서 이 횟수 이상 반복되면 중단)
 - `PI_EXEC_TIMEOUT`
 - `PI_NO_MEMORY`
 - `PI_MEMORY_MODE`
@@ -98,6 +99,70 @@ $env:PI_SESSION="fixer"; python chat.py
 - `PI_BLOCKED_PATHS`
 - `PI_READ_STRATEGY` (`smart` 기본, 또는 `legacy`)
 - `PI_EXEC_PATH_CORRECTION` (기본 `false`, 제한적 경로 교정)
+- `PI_PLAN_MODE` (`on|off`, 기본 `off`)
+
+## Todo 툴 (세션 작업 추적)
+
+Pi는 세션 내 할 일 목록을 관리하는 빌트인 `todo_read` / `todo_write` 툴을 제공합니다.
+
+- `todo_write`: JSON 배열로 세션 할 일 목록을 교체합니다.
+- `todo_read`: 상태 아이콘과 우선순위가 포함된 현재 목록을 반환합니다.
+
+### 채팅에서 사용하기
+
+자연어로 요청하면 됩니다:
+
+```
+todo 목록 보여줘
+할 일 목록 만들어줘: 1) 버그 수정 (high), 2) 테스트 작성 (medium)
+첫 번째 항목 완료 처리해줘
+```
+
+멀티스텝 작업을 요청하면, 에이전트가 자동으로 todo 목록을 생성하고 업데이트합니다.
+
+### todo_write 입력 형식
+
+JSON 배열로 입력합니다:
+
+```json
+[
+  {"content": "로그인 버그 수정", "status": "pending", "priority": "high"},
+  {"content": "유닛 테스트 작성", "status": "in_progress", "priority": "medium"},
+  {"content": "문서 업데이트", "priority": "low"}
+]
+```
+
+필드:
+- `content` (필수): 작업 내용
+- `status`: `pending` | `in_progress` | `completed` | `cancelled` (기본: `pending`)
+- `priority`: `high` | `medium` | `low` (기본: `medium`)
+
+ID는 자동 할당됩니다 (1부터 순서대로).
+
+### todo_read 출력 형식
+
+```
+[ ] [high] #1 로그인 버그 수정
+[~] [medium] #2 유닛 테스트 작성
+[ ] [low] #3 문서 업데이트
+```
+
+상태 아이콘: `[ ]` 대기 · `[~]` 진행 중 · `[x]` 완료 · `[-]` 취소
+
+> **참고:** Todo 상태는 세션 단위 인메모리 저장입니다. 에이전트를 재시작하면 초기화됩니다. (Claude Code의 TodoRead/TodoWrite와 동일한 방식)
+
+## Plan 모드 (Claude 스타일)
+
+- 활성화:
+  - 채팅: `/plan on`
+  - CLI: `python openclaw_pi_langchain.py --plan-mode on "요청 프롬프트"`
+  - 환경변수: `PI_PLAN_MODE=on`
+- Plan 모드에서는 읽기 전용 계획 동작을 강제합니다.
+  - 차단 툴: `write`, `edit`, `exec`, `memory_store`
+  - 허용 툴(기존 정책 범위 내): `read`, `ls`, `find`, `grep`, `memory_search`, `memory_get`
+- Plan 모드에서는 스킬 precheck 실패를 완화해 즉시 실패 대신 계획 응답을 반환합니다.
+- Legacy 자동 메모리 저장은 Plan 모드에서 비활성화됩니다.
+- 비활성화: `/plan off` 또는 `--plan-mode off`
 
 ## 실행 실패 가드 (v1)
 
@@ -108,6 +173,14 @@ $env:PI_SESSION="fixer"; python chat.py
   - `retryable=true|false`
 - 동일한 `exec` 실패는 세션 단위로 차단되어 반복 루프를 줄입니다.
 - 최근 실패 요약(Failure Digest)을 주입해 전략 전환을 유도합니다.
+
+## 툴 반복 호출 가드 (v1)
+
+- 동일한 툴 호출(`tool_name + 정규화된 args`)을 실행 단위로 추적합니다.
+- 같은 호출이 `PI_TOOL_REPEAT_LIMIT` 횟수(기본 `3`)에 도달하면 루프 방지를 위해 실행을 중단합니다.
+- 중단 후에는 툴 없이 1회 복구 응답을 시도하여:
+  - 수집된 컨텍스트로 가능한 직접 답변을 제공하거나,
+  - 정보가 부족하면 핵심 후속 질문 1개를 제시합니다.
 
 ## Read 토큰 효율 (v1)
 

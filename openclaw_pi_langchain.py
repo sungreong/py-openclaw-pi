@@ -4,26 +4,33 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import hashlib
+import importlib
+import importlib.util
 import json
 import math
 import os
+import queue
 import re
 import sqlite3
 import struct
 import subprocess
 import sys
+import threading
 import time
+import types
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, Protocol, Sequence
 
 from dotenv import load_dotenv
+from pydantic import Field, create_model
 
 from langchain.agents import create_agent
 from langchain.agents.middleware import ModelCallLimitMiddleware
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.tools import StructuredTool
 from langchain.tools import tool
 from langgraph.config import get_stream_writer
 
@@ -59,6 +66,7 @@ class PiAgentConfig:
     temperature: float = 0.0
     max_tokens: Optional[int] = None
     max_model_calls: int = 16
+    tool_repeat_limit: int = 3
     exec_timeout_s: int = 60
     allow_shell: bool = True
     allow_write: bool = True
@@ -81,6 +89,16 @@ class PiAgentConfig:
     read_preview_head_lines: int = 120
     read_preview_tail_lines: int = 80
     read_output_budget_chars: int = 20000
+    custom_tool_modules: list[str] = field(default_factory=list)
+    mcp_enabled: bool = True
+    mcp_config_path: str = "mcp_servers.json"
+    mcp_fail_fast: bool = False
+    mcp_timeout_s: int = 20
+    skills_enabled: bool = True
+    skills_dir: str = "skills"
+    skill_mode: str = "auto"
+    skill_name: Optional[str] = None
+    plan_mode: str = "off"
     blocked_paths: list[str] = field(default_factory=lambda: list(DEFAULT_BLOCKED_PATHS))
 
     def workspace_path(self) -> Path:
@@ -103,6 +121,31 @@ class PiRunResult:
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     tool_results: list[dict[str, Any]] = field(default_factory=list)
     audit_file: Optional[Path] = None
+
+
+@dataclass(slots=True)
+class SkillSpec:
+    id: str
+    name: str
+    description: str
+    triggers: list[str] = field(default_factory=list)
+    required_tools: list[str] = field(default_factory=list)
+    required_env: list[str] = field(default_factory=list)
+    tool_allow: list[str] = field(default_factory=list)
+    tool_deny: list[str] = field(default_factory=list)
+    api_policy: str = "tool_first"
+    workflow: str = ""
+    output_format: str = ""
+    source_path: str = ""
+
+
+@dataclass(slots=True)
+class PlanRuntimePolicy:
+    mode: str = "off"
+    forced_deny_tools: tuple[str, ...] = ()
+    skip_skill_precheck_fail: bool = False
+    disable_legacy_memory_write: bool = False
+    planner_directive: str = ""
 
 
 class PiCallbacks(Protocol):
@@ -683,6 +726,376 @@ def extract_text(message_or_chunk: Any) -> str:
     return ""
 
 
+def _is_tool_like(candidate: Any) -> bool:
+    if candidate is None:
+        return False
+    name = str(getattr(candidate, "name", "")).strip()
+    if not name:
+        return False
+    return callable(getattr(candidate, "invoke", None)) or callable(getattr(candidate, "run", None))
+
+
+def _safe_tool_name(value: str) -> str:
+    # OpenAI function/tool name pattern: ^[a-zA-Z0-9_-]+$
+    return re.sub(r"[^a-zA-Z0-9_-]", "_", str(value or "").strip()).strip("_-")
+
+
+def _tool_name_keys(value: str) -> set[str]:
+    raw = str(value or "").strip().lower()
+    safe = _safe_tool_name(raw).lower()
+    return {k for k in {raw, safe} if k}
+
+
+def _to_bool(raw: Any, default: bool = False) -> bool:
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    text = str(raw).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _to_str_list(raw: Any) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        return [item.strip() for item in re.split(r"[,\n]", raw) if item.strip()]
+    if isinstance(raw, (list, tuple, set)):
+        out: list[str] = []
+        for item in raw:
+            text = str(item).strip()
+            if text:
+                out.append(text)
+        return out
+    text = str(raw).strip()
+    return [text] if text else []
+
+
+def _yaml_scalar(raw: str) -> Any:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    if (text.startswith('"') and text.endswith('"')) or (text.startswith("'") and text.endswith("'")):
+        return text[1:-1]
+    if text.startswith("[") and text.endswith("]"):
+        body = text[1:-1].strip()
+        if not body:
+            return []
+        return [part.strip().strip("'").strip('"') for part in body.split(",") if part.strip()]
+    low = text.lower()
+    if low in {"true", "yes", "on"}:
+        return True
+    if low in {"false", "no", "off"}:
+        return False
+    return text
+
+
+def _parse_simple_yaml_frontmatter(text: str) -> dict[str, Any]:
+    data: dict[str, Any] = {}
+    active_list_key: Optional[str] = None
+    active_block_key: Optional[str] = None
+    block_lines: list[str] = []
+    lines = str(text or "").splitlines()
+    for raw in lines:
+        line = raw.rstrip()
+        if active_block_key:
+            if line.startswith("  ") or line.startswith("\t"):
+                block_lines.append(line[2:] if line.startswith("  ") else line.lstrip("\t"))
+                continue
+            data[active_block_key] = "\n".join(block_lines).strip()
+            active_block_key = None
+            block_lines = []
+        if not line.strip():
+            continue
+        if line.lstrip().startswith("#"):
+            continue
+        m = re.match(r"^([A-Za-z0-9_]+):\s*(.*)$", line)
+        if m:
+            key = m.group(1).strip().lower()
+            value = m.group(2).strip()
+            if not value:
+                data[key] = []
+                active_list_key = key
+                active_block_key = None
+            else:
+                if value in {"|", ">"}:
+                    active_block_key = key
+                    block_lines = []
+                    active_list_key = None
+                else:
+                    data[key] = _yaml_scalar(value)
+                    active_list_key = None
+                    active_block_key = None
+            continue
+        m_item = re.match(r"^\s*-\s+(.*)$", line)
+        if m_item and active_list_key:
+            item = _yaml_scalar(m_item.group(1).strip())
+            bucket = data.get(active_list_key)
+            if not isinstance(bucket, list):
+                bucket = []
+                data[active_list_key] = bucket
+            bucket.append(item)
+    if active_block_key:
+        data[active_block_key] = "\n".join(block_lines).strip()
+    return data
+
+
+def _split_frontmatter(content: str) -> tuple[Optional[str], str]:
+    text = str(content or "")
+    if not text.startswith("---"):
+        return None, text
+    m = re.match(r"^---\s*\r?\n(.*?)\r?\n---\s*\r?\n?(.*)$", text, flags=re.DOTALL)
+    if not m:
+        return None, text
+    return m.group(1), m.group(2)
+
+
+def _normalize_skill_mode(raw: Any) -> str:
+    mode = str(raw or "auto").strip().lower()
+    return mode if mode in {"auto", "manual", "off"} else "auto"
+
+
+def _normalize_plan_mode(raw: Any) -> str:
+    mode = str(raw or "off").strip().lower()
+    return mode if mode in {"on", "off"} else "off"
+
+
+def _tool_clone_with_name(tool_obj: Any, new_name: str) -> Any:
+    current = str(getattr(tool_obj, "name", "")).strip()
+    target = str(new_name or "").strip()
+    if not target:
+        raise ValueError("tool name cannot be empty")
+    if current == target:
+        return tool_obj
+
+    clone_candidates = ["model_copy", "copy"]
+    for method_name in clone_candidates:
+        method = getattr(tool_obj, method_name, None)
+        if callable(method):
+            try:
+                clone = method(deep=True)
+                setattr(clone, "name", target)
+                return clone
+            except Exception:
+                pass
+    try:
+        setattr(tool_obj, "name", target)
+        return tool_obj
+    except Exception as exc:
+        raise ValueError(f"tool rename failed ({current} -> {target}): {exc}") from exc
+
+
+def _json_schema_type_to_python(spec: Any) -> Any:
+    if not isinstance(spec, dict):
+        return Any
+    kind = spec.get("type")
+    if isinstance(kind, list):
+        kinds = [k for k in kind if k != "null"]
+        kind = kinds[0] if kinds else "string"
+    if kind == "string":
+        return str
+    if kind == "integer":
+        return int
+    if kind == "number":
+        return float
+    if kind == "boolean":
+        return bool
+    return Any
+
+
+def _build_args_schema_from_json_schema(schema: Any, model_name: str):
+    if not isinstance(schema, dict):
+        return None
+    if schema.get("type") not in {None, "object"}:
+        return None
+    props = schema.get("properties", {})
+    if not isinstance(props, dict) or not props:
+        return None
+    required = set(schema.get("required", [])) if isinstance(schema.get("required", []), list) else set()
+    fields: dict[str, tuple[Any, Any]] = {}
+    for raw_key, spec in props.items():
+        key = str(raw_key).strip()
+        if not key:
+            continue
+        py_type = _json_schema_type_to_python(spec)
+        description = ""
+        if isinstance(spec, dict):
+            description = str(spec.get("description", "")).strip()
+        if key in required:
+            fields[key] = (py_type, Field(description=description))
+        else:
+            fields[key] = (Optional[py_type], Field(default=None, description=description))
+    if not fields:
+        return None
+    safe_model_name = re.sub(r"[^a-zA-Z0-9_]", "_", model_name)
+    return create_model(safe_model_name, **fields)
+
+
+def _render_mcp_result(result: Any) -> str:
+    if not isinstance(result, dict):
+        return str(result)
+    items = result.get("content")
+    rows: list[str] = []
+    if isinstance(items, list):
+        for item in items:
+            if isinstance(item, dict) and item.get("type") == "text":
+                rows.append(str(item.get("text", "")))
+            else:
+                rows.append(json.dumps(item, ensure_ascii=False))
+    if not rows:
+        rows.append(json.dumps(result, ensure_ascii=False))
+    output = "\n".join(x for x in rows if str(x).strip()) or "(empty result)"
+    if bool(result.get("isError")):
+        return f"Error: {output}"
+    return output
+
+
+class McpStdioClient:
+    def __init__(self, name: str, command: str, args: Sequence[str], env: dict[str, str], timeout_s: int):
+        self.name = name
+        self.command = command
+        self.args = list(args)
+        self.env = dict(env)
+        self.timeout_s = max(1, int(timeout_s))
+        self._proc: Optional[subprocess.Popen[Any]] = None
+        self._reader_thread: Optional[threading.Thread] = None
+        self._messages: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._jsonrpc_id = 0
+        self._lock = threading.Lock()
+        self._tools: list[dict[str, Any]] = []
+
+    def start(self) -> None:
+        if self._proc is not None:
+            return
+        merged_env = dict(os.environ)
+        merged_env.update({str(k): str(v) for k, v in self.env.items()})
+        self._proc = subprocess.Popen(
+            [self.command, *self.args],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=False,
+            env=merged_env,
+        )
+        self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True, name=f"mcp-reader-{self.name}")
+        self._reader_thread.start()
+        self._initialize()
+        self._tools = self._list_tools()
+
+    def close(self) -> None:
+        proc = self._proc
+        self._proc = None
+        if not proc:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=1.0)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    def tools(self) -> list[dict[str, Any]]:
+        return list(self._tools)
+
+    def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        result = self._request("tools/call", {"name": tool_name, "arguments": arguments or {}})
+        if not isinstance(result, dict):
+            return {"content": [{"type": "text", "text": str(result)}]}
+        return result
+
+    def _read_one_message(self) -> dict[str, Any]:
+        if self._proc is None or self._proc.stdout is None:
+            raise RuntimeError("MCP process is not running")
+        stdout = self._proc.stdout
+        headers: dict[str, str] = {}
+        while True:
+            line = stdout.readline()
+            if not line:
+                raise RuntimeError("MCP stdout closed")
+            if line in (b"\r\n", b"\n"):
+                break
+            decoded = line.decode("utf-8", errors="replace").strip()
+            if ":" in decoded:
+                key, value = decoded.split(":", 1)
+                headers[key.strip().lower()] = value.strip()
+        content_len = int(headers.get("content-length", "0"))
+        if content_len <= 0:
+            raise RuntimeError("MCP message missing Content-Length")
+        payload = stdout.read(content_len)
+        if not payload:
+            raise RuntimeError("MCP message payload is empty")
+        return json.loads(payload.decode("utf-8", errors="replace"))
+
+    def _reader_loop(self) -> None:
+        try:
+            while self._proc is not None:
+                msg = self._read_one_message()
+                self._messages.put(msg)
+        except Exception as e:
+            self._messages.put({"__error__": str(e)})
+
+    def _write_message(self, payload: dict[str, Any]) -> None:
+        if self._proc is None or self._proc.stdin is None:
+            raise RuntimeError("MCP process is not running")
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        header = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+        self._proc.stdin.write(header + body)
+        self._proc.stdin.flush()
+
+    def _next_id(self) -> int:
+        with self._lock:
+            self._jsonrpc_id += 1
+            return self._jsonrpc_id
+
+    def _request(self, method: str, params: Optional[dict[str, Any]] = None) -> Any:
+        rid = self._next_id()
+        self._write_message({"jsonrpc": "2.0", "id": rid, "method": method, "params": params or {}})
+        deadline = time.time() + float(self.timeout_s)
+        while True:
+            remaining = max(0.01, deadline - time.time())
+            if remaining <= 0:
+                raise TimeoutError(f"MCP request timed out: {method}")
+            try:
+                msg = self._messages.get(timeout=remaining)
+            except queue.Empty:
+                raise TimeoutError(f"MCP response timeout: {method}") from None
+            if "__error__" in msg:
+                raise RuntimeError(str(msg["__error__"]))
+            if msg.get("id") != rid:
+                continue
+            if "error" in msg:
+                raise RuntimeError(json.dumps(msg.get("error"), ensure_ascii=False))
+            return msg.get("result")
+
+    def _initialize(self) -> None:
+        _ = self._request(
+            "initialize",
+            {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "openclaw-pi", "version": "1.1.0"},
+            },
+        )
+        try:
+            self._write_message({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
+        except Exception:
+            pass
+
+    def _list_tools(self) -> list[dict[str, Any]]:
+        result = self._request("tools/list", {})
+        if isinstance(result, dict):
+            tools = result.get("tools", [])
+            if isinstance(tools, list):
+                return [x for x in tools if isinstance(x, dict)]
+        return []
+
+
 class OpenClawPiLangChain:
     def __init__(
         self,
@@ -707,6 +1120,11 @@ class OpenClawPiLangChain:
         self._session_exec_failure_recent: dict[str, list[dict[str, Any]]] = {}
         self._session_mutation_ticks: dict[str, int] = {}
         self._session_turn_read_chars: dict[str, int] = {}
+        self._todo_items: list[dict[str, Any]] = []
+        self._pending_audit_events: list[tuple[str, dict[str, Any]]] = []
+        self._tool_sources: dict[str, str] = {}
+        self._mcp_clients: dict[str, McpStdioClient] = {}
+        self.skills_by_id: dict[str, SkillSpec] = {}
 
         self.model = init_chat_model(
             config.model,
@@ -719,10 +1137,637 @@ class OpenClawPiLangChain:
             max_tokens=1200,
         )
 
-        tools = self._build_default_tools()
-        if extra_tools:
-            tools.extend(extra_tools)
-        self.all_tools = tools
+        self.all_tools = self._build_tool_registry(extra_tools=extra_tools)
+        self.skills_by_id = self._discover_skills()
+
+    def _queue_audit(self, event_type: str, payload: dict[str, Any]) -> None:
+        self._pending_audit_events.append((event_type, payload))
+
+    def _flush_pending_audit(self, session_id: str) -> None:
+        if not self._pending_audit_events:
+            return
+        for event_type, payload in self._pending_audit_events:
+            self.audit_logger.log(session_id, event_type, payload)
+        self._pending_audit_events = []
+
+    def _build_tool_registry(self, extra_tools: Optional[Sequence[Any]]) -> list[Any]:
+        builtin_tools = self._build_default_tools()
+        self._register_tool_batch(builtin_tools, source="builtin")
+        builtin_names = {str(getattr(t, "name", "")).strip() for t in builtin_tools}
+
+        custom_tools = self._load_custom_tools(builtin_names=builtin_names)
+        self._register_tool_batch(custom_tools, source="custom")
+
+        used_custom_names = set(builtin_names)
+        used_custom_names.update(str(getattr(t, "name", "")).strip() for t in custom_tools)
+        raw_inline_custom = [t for t in (extra_tools or []) if _is_tool_like(t)]
+        inline_custom = self._normalize_custom_tool_names(
+            raw_tools=raw_inline_custom,
+            module_short="inline",
+            builtin_names=builtin_names,
+            used_names=used_custom_names,
+        )
+        self._register_tool_batch(inline_custom, source="custom")
+
+        mcp_tools = self._load_mcp_tools()
+        self._register_tool_batch(mcp_tools, source="mcp")
+
+        all_tools = [*builtin_tools, *custom_tools, *inline_custom, *mcp_tools]
+        summary = {
+            "total": len(all_tools),
+            "builtin": len(builtin_tools),
+            "custom": len(custom_tools) + len(inline_custom),
+            "mcp": len(mcp_tools),
+            "tools": [str(getattr(t, "name", "")) for t in all_tools],
+        }
+        self._queue_audit("tool_registry_summary", summary)
+        return all_tools
+
+    def _register_tool_batch(self, tools: Sequence[Any], source: str) -> None:
+        for tool_obj in tools:
+            name = str(getattr(tool_obj, "name", "")).strip()
+            if not name:
+                continue
+            self._tool_sources[name] = source
+
+    def _module_name_for_path(self, file_path: Path) -> str:
+        base = _safe_tool_name(file_path.stem) or "custom"
+        stamp = str(int(time.time() * 1000))
+        return f"pi_custom_{base}_{stamp}"
+
+    def _import_custom_module(self, module_ref: str):
+        ref = str(module_ref or "").strip()
+        if not ref:
+            raise ValueError("empty module reference")
+        is_file_ref = ref.endswith(".py") or "/" in ref or "\\" in ref
+        if is_file_ref:
+            candidate = Path(ref)
+            if not candidate.is_absolute():
+                candidate = self.workspace_dir / candidate
+            resolved = candidate.resolve()
+            try:
+                resolved.relative_to(self.workspace_dir)
+            except ValueError as exc:
+                raise ValueError(f"custom tool module path escapes workspace: {ref}") from exc
+            if not resolved.exists() or not resolved.is_file():
+                raise ValueError(f"custom tool module file not found: {resolved}")
+            spec = importlib.util.spec_from_file_location(self._module_name_for_path(resolved), resolved)
+            if spec is None or spec.loader is None:
+                raise ValueError(f"unable to create module spec: {resolved}")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+        sys.path.insert(0, str(self.workspace_dir))
+        try:
+            return importlib.import_module(ref)
+        finally:
+            if sys.path and sys.path[0] == str(self.workspace_dir):
+                sys.path.pop(0)
+
+    def _extract_custom_tools_from_module(self, module: types.ModuleType) -> list[Any]:
+        if callable(getattr(module, "get_tools", None)):
+            loaded = module.get_tools()
+        elif hasattr(module, "TOOLS"):
+            loaded = getattr(module, "TOOLS")
+        else:
+            raise ValueError("custom tool module requires get_tools() or TOOLS")
+        if not isinstance(loaded, (list, tuple)):
+            raise ValueError("custom tool module output must be a list/tuple of tools")
+        out = []
+        for item in loaded:
+            if _is_tool_like(item):
+                out.append(item)
+        if not out:
+            raise ValueError("no valid tools found in module")
+        return out
+
+    def _normalize_custom_tool_names(
+        self,
+        raw_tools: Sequence[Any],
+        module_short: str,
+        builtin_names: set[str],
+        used_names: set[str],
+    ) -> list[Any]:
+        normalized: list[Any] = []
+        safe_module_short = _safe_tool_name(module_short) or "custom"
+        used_keys = {_safe_tool_name(name).lower() for name in used_names if str(name).strip()}
+        builtin_keys = {_safe_tool_name(name).lower() for name in builtin_names if str(name).strip()}
+        for tool_obj in raw_tools:
+            original_name = str(getattr(tool_obj, "name", "")).strip()
+            if not original_name:
+                continue
+            target_name = _safe_tool_name(original_name) or "tool"
+            if target_name.lower() in builtin_keys:
+                raise ValueError(f"custom tool name conflicts with builtin tool: {original_name}")
+            if target_name.lower() in used_keys:
+                base = f"custom_{safe_module_short}_{_safe_tool_name(original_name) or 'tool'}"
+                target_name = base
+                suffix = 2
+                while target_name.lower() in used_keys:
+                    target_name = f"{base}_{suffix}"
+                    suffix += 1
+                tool_obj = _tool_clone_with_name(tool_obj, target_name)
+            elif original_name != target_name:
+                tool_obj = _tool_clone_with_name(tool_obj, target_name)
+            used_names.add(target_name)
+            used_keys.add(target_name.lower())
+            normalized.append(tool_obj)
+        return normalized
+
+    def _load_custom_tools(self, builtin_names: set[str]) -> list[Any]:
+        custom_refs = [x for x in (self.config.custom_tool_modules or []) if str(x).strip()]
+        if not custom_refs:
+            return []
+        used_names = set(builtin_names)
+        loaded_tools: list[Any] = []
+        for module_ref in custom_refs:
+            try:
+                module = self._import_custom_module(str(module_ref))
+                raw_tools = self._extract_custom_tools_from_module(module)
+                module_name = _safe_tool_name(getattr(module, "__name__", "custom")) or "custom"
+                module_short = module_name.split(".")[-1]
+                loaded_tools.extend(
+                    self._normalize_custom_tool_names(
+                        raw_tools=raw_tools,
+                        module_short=module_short,
+                        builtin_names=builtin_names,
+                        used_names=used_names,
+                    )
+                )
+                self._queue_audit(
+                    "custom_tool_load_ok",
+                    {
+                        "module": str(module_ref),
+                        "tool_count": len(raw_tools),
+                        "tools": [str(getattr(t, "name", "")) for t in raw_tools],
+                    },
+                )
+            except Exception as e:
+                self._queue_audit(
+                    "custom_tool_load_fail",
+                    {"module": str(module_ref), "error": str(e)},
+                )
+                raise
+        return loaded_tools
+
+    def _resolve_mcp_config_path(self) -> Path:
+        raw = str(self.config.mcp_config_path or "mcp_servers.json").strip()
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            candidate = self.workspace_dir / candidate
+        return candidate.resolve()
+
+    def _load_mcp_config(self) -> list[dict[str, Any]]:
+        if not self.config.mcp_enabled:
+            return []
+        config_path = self._resolve_mcp_config_path()
+        if not config_path.exists():
+            return []
+        text = config_path.read_text(encoding="utf-8")
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            raise ValueError("mcp config must be a JSON object")
+        servers = data.get("servers", [])
+        if not isinstance(servers, list):
+            raise ValueError("mcp config 'servers' must be a list")
+        out: list[dict[str, Any]] = []
+        names: set[str] = set()
+        for row in servers:
+            if not isinstance(row, dict):
+                continue
+            name = _safe_tool_name(row.get("name"))
+            if not name:
+                continue
+            if name in names:
+                raise ValueError(f"duplicate MCP server name: {name}")
+            names.add(name)
+            enabled = _to_bool(row.get("enabled", True), default=True)
+            transport = str(row.get("transport", "stdio")).strip().lower()
+            command = str(row.get("command", "")).strip()
+            args = row.get("args", [])
+            env = row.get("env", {})
+            timeout_s = int(row.get("timeout_s", self.config.mcp_timeout_s))
+            out.append(
+                {
+                    "name": name,
+                    "enabled": enabled,
+                    "transport": transport,
+                    "command": command,
+                    "args": args if isinstance(args, list) else [],
+                    "env": env if isinstance(env, dict) else {},
+                    "timeout_s": max(1, timeout_s),
+                }
+            )
+        return out
+
+    def _make_mcp_langchain_tool(
+        self,
+        server_name: str,
+        remote_tool_name: str,
+        remote_description: str,
+        input_schema: Any,
+    ):
+        mcp_tool_name = f"mcp_{server_name}_{_safe_tool_name(remote_tool_name) or 'tool'}"
+        args_schema = _build_args_schema_from_json_schema(
+            input_schema,
+            f"McpTool_{_safe_tool_name(server_name)}_{_safe_tool_name(remote_tool_name)}",
+        )
+
+        def _invoke_mcp_tool(**kwargs: Any) -> str:
+            client = self._mcp_clients.get(server_name)
+            if client is None:
+                return f"Error: MCP server '{server_name}' is unavailable."
+            self.audit_logger.log(
+                str(self._active_session_id or "main"),
+                "mcp_tool_call",
+                {"server": server_name, "tool": remote_tool_name, "args_keys": sorted(kwargs.keys())},
+            )
+            result = client.call_tool(remote_tool_name, kwargs or {})
+            return _render_mcp_result(result)
+
+        description = (remote_description or "").strip() or f"MCP tool {remote_tool_name} from server {server_name}."
+        if args_schema is not None:
+            return StructuredTool.from_function(
+                func=_invoke_mcp_tool,
+                name=mcp_tool_name,
+                description=description,
+                args_schema=args_schema,
+            )
+
+        @tool(mcp_tool_name)
+        def _noarg_mcp_tool() -> str:
+            """Call an MCP tool that does not require arguments."""
+            return _invoke_mcp_tool()
+
+        _noarg_mcp_tool.description = description
+        return _noarg_mcp_tool
+
+    def _load_mcp_tools(self) -> list[Any]:
+        servers = self._load_mcp_config()
+        if not servers:
+            return []
+        loaded: list[Any] = []
+        for server in servers:
+            if not server.get("enabled", True):
+                continue
+            name = str(server.get("name", "")).strip()
+            transport = str(server.get("transport", "stdio")).strip().lower()
+            if transport != "stdio":
+                self._queue_audit(
+                    "mcp_server_connect_fail",
+                    {"server": name, "error": f"unsupported transport: {transport}"},
+                )
+                continue
+            command = str(server.get("command", "")).strip()
+            if not command:
+                self._queue_audit("mcp_server_connect_fail", {"server": name, "error": "missing command"})
+                continue
+            try:
+                client = McpStdioClient(
+                    name=name,
+                    command=command,
+                    args=[str(x) for x in (server.get("args", []) or [])],
+                    env={str(k): str(v) for k, v in (server.get("env", {}) or {}).items()},
+                    timeout_s=int(server.get("timeout_s", self.config.mcp_timeout_s)),
+                )
+                client.start()
+                self._mcp_clients[name] = client
+                remote_tools = client.tools()
+                for row in remote_tools:
+                    remote_name = str(row.get("name", "")).strip()
+                    if not remote_name:
+                        continue
+                    loaded.append(
+                        self._make_mcp_langchain_tool(
+                            server_name=name,
+                            remote_tool_name=remote_name,
+                            remote_description=str(row.get("description", "")).strip(),
+                            input_schema=row.get("inputSchema", {}),
+                        )
+                    )
+                self._queue_audit(
+                    "mcp_server_connect_ok",
+                    {"server": name, "tool_count": len(remote_tools)},
+                )
+            except Exception as e:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+                self._queue_audit("mcp_server_connect_fail", {"server": name, "error": str(e)})
+                if self.config.mcp_fail_fast:
+                    raise
+        return loaded
+
+    def close(self) -> None:
+        for _name, client in list(self._mcp_clients.items()):
+            try:
+                client.close()
+            except Exception:
+                pass
+        self._mcp_clients = {}
+
+    def _resolve_skills_root(self) -> Path:
+        raw = str(self.config.skills_dir or "skills").strip()
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            candidate = self.workspace_dir / candidate
+        resolved = candidate.resolve()
+        try:
+            resolved.relative_to(self.workspace_dir)
+        except ValueError as exc:
+            raise ValueError(f"skills_dir escapes workspace: {raw}") from exc
+        return resolved
+
+    def _load_skill_from_path(self, path: Path) -> SkillSpec:
+        content = path.read_text(encoding="utf-8")
+        frontmatter_raw, body = _split_frontmatter(content)
+        if frontmatter_raw is None:
+            raise ValueError("SKILL.md frontmatter is required")
+        meta = _parse_simple_yaml_frontmatter(frontmatter_raw)
+        skill_id = _safe_tool_name(meta.get("id") or path.parent.name)
+        if not skill_id:
+            raise ValueError("skill id is empty")
+        name = str(meta.get("name") or skill_id).strip()
+        description = str(meta.get("description") or "").strip()
+        if not description:
+            description = body.strip().splitlines()[0].strip() if body.strip() else f"Skill {skill_id}"
+        triggers = _to_str_list(meta.get("triggers"))
+        required_tools = _to_str_list(meta.get("required_tools"))
+        required_env = _to_str_list(meta.get("required_env"))
+        tool_allow = _to_str_list(meta.get("tool_allow"))
+        tool_deny = _to_str_list(meta.get("tool_deny"))
+        api_policy = str(meta.get("api_policy") or "tool_first").strip().lower() or "tool_first"
+        workflow = str(meta.get("workflow") or "").strip()
+        output_format = str(meta.get("output_format") or "").strip()
+        body_text = body.strip()
+        if body_text:
+            if not workflow:
+                workflow = body_text
+            elif not output_format:
+                output_format = body_text
+        return SkillSpec(
+            id=skill_id,
+            name=name,
+            description=description,
+            triggers=triggers,
+            required_tools=required_tools,
+            required_env=required_env,
+            tool_allow=tool_allow,
+            tool_deny=tool_deny,
+            api_policy=api_policy,
+            workflow=workflow,
+            output_format=output_format,
+            source_path=str(path),
+        )
+
+    def _discover_skills(self) -> dict[str, SkillSpec]:
+        if not self.config.skills_enabled:
+            return {}
+        skills_root = self._resolve_skills_root()
+        if not skills_root.exists() or not skills_root.is_dir():
+            return {}
+        discovered: dict[str, SkillSpec] = {}
+        for skill_file in sorted(skills_root.glob("*/SKILL.md")):
+            try:
+                skill = self._load_skill_from_path(skill_file)
+                if skill.id in discovered:
+                    raise ValueError(f"duplicate skill id: {skill.id}")
+                discovered[skill.id] = skill
+                self._queue_audit(
+                    "skill_discovered",
+                    {"skill_id": skill.id, "name": skill.name, "path": skill.source_path},
+                )
+            except Exception as e:
+                self._queue_audit(
+                    "skill_invalid",
+                    {"path": str(skill_file), "error": str(e)},
+                )
+        return discovered
+
+    def list_skills(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for skill_id in sorted(self.skills_by_id.keys()):
+            skill = self.skills_by_id[skill_id]
+            rows.append(
+                {
+                    "id": skill.id,
+                    "name": skill.name,
+                    "description": skill.description,
+                    "triggers": list(skill.triggers),
+                    "required_tools": list(skill.required_tools),
+                    "required_env": list(skill.required_env),
+                    "api_policy": skill.api_policy,
+                }
+            )
+        return rows
+
+    def _find_skill_by_name(self, name: str) -> Optional[SkillSpec]:
+        target = _safe_tool_name(name).lower()
+        if not target:
+            return None
+        if target in self.skills_by_id:
+            return self.skills_by_id[target]
+        for skill in self.skills_by_id.values():
+            if _safe_tool_name(skill.name).lower() == target:
+                return skill
+        return None
+
+    def _score_skill(self, skill: SkillSpec, prompt: str) -> int:
+        text = str(prompt or "").lower()
+        if not text:
+            return 0
+        score = 0
+        name_tokens = [t for t in re.split(r"[\s_.-]+", skill.name.lower()) if len(t) >= 3]
+        for token in name_tokens:
+            if token in text:
+                score += 2
+        desc_tokens = [t for t in re.split(r"[\s_.-]+", skill.description.lower()) if len(t) >= 4]
+        for token in desc_tokens[:8]:
+            if token in text:
+                score += 1
+        for trigger in skill.triggers:
+            trig = str(trigger).strip().lower()
+            if trig and trig in text:
+                score += 5
+        return score
+
+    def _select_skill(
+        self,
+        prompt: str,
+        skill_name: Optional[str],
+        skill_mode: Optional[str],
+        session_id: str,
+    ) -> Optional[SkillSpec]:
+        if not self.config.skills_enabled:
+            self.audit_logger.log(session_id, "skill_not_selected", {"reason": "skills_disabled"})
+            return None
+        mode = _normalize_skill_mode(skill_mode or self.config.skill_mode)
+        explicit = str(skill_name or self.config.skill_name or "").strip()
+        if mode == "off":
+            self.audit_logger.log(session_id, "skill_not_selected", {"reason": "skill_mode_off"})
+            return None
+        if explicit:
+            selected = self._find_skill_by_name(explicit)
+            if not selected:
+                self.audit_logger.log(
+                    session_id,
+                    "skill_not_selected",
+                    {"reason": "skill_name_not_found", "skill_name": explicit, "mode": mode},
+                )
+                return None
+            self.audit_logger.log(
+                session_id,
+                "skill_selected",
+                {"skill_id": selected.id, "skill_name": selected.name, "mode": "manual"},
+            )
+            return selected
+        if mode == "manual":
+            self.audit_logger.log(session_id, "skill_not_selected", {"reason": "manual_without_skill_name"})
+            return None
+        best: Optional[SkillSpec] = None
+        best_score = 0
+        for skill in self.skills_by_id.values():
+            score = self._score_skill(skill, prompt)
+            if score > best_score:
+                best = skill
+                best_score = score
+        if not best or best_score <= 0:
+            self.audit_logger.log(session_id, "skill_not_selected", {"reason": "auto_no_match"})
+            return None
+        self.audit_logger.log(
+            session_id,
+            "skill_selected",
+            {"skill_id": best.id, "skill_name": best.name, "mode": "auto", "score": best_score},
+        )
+        return best
+
+    def _apply_skill_tool_policy(self, tools: Sequence[Any], skill: SkillSpec) -> list[Any]:
+        out = list(tools)
+        if skill.tool_allow:
+            allow_keys: set[str] = set()
+            for name in skill.tool_allow:
+                allow_keys.update(_tool_name_keys(str(name)))
+            out = [
+                tool_obj
+                for tool_obj in out
+                if _tool_name_keys(str(getattr(tool_obj, "name", ""))).intersection(allow_keys)
+            ]
+        if skill.tool_deny:
+            deny_keys: set[str] = set()
+            for name in skill.tool_deny:
+                deny_keys.update(_tool_name_keys(str(name)))
+            out = [
+                tool_obj
+                for tool_obj in out
+                if not _tool_name_keys(str(getattr(tool_obj, "name", ""))).intersection(deny_keys)
+            ]
+        return out
+
+    def _skill_precheck(self, tools: Sequence[Any], skill: SkillSpec) -> tuple[bool, str]:
+        tool_map: dict[str, Any] = {}
+        for tool_obj in tools:
+            for key in _tool_name_keys(str(getattr(tool_obj, "name", ""))):
+                tool_map[key] = tool_obj
+        missing_tools: list[str] = []
+        for required in skill.required_tools:
+            req_keys = _tool_name_keys(str(required))
+            if req_keys and not any(key in tool_map for key in req_keys):
+                missing_tools.append(required)
+        missing_env: list[str] = []
+        for env_name in skill.required_env:
+            key = str(env_name).strip()
+            if key and not os.getenv(key):
+                missing_env.append(key)
+        if not missing_tools and not missing_env:
+            return True, ""
+        rows = [f"Skill precheck failed: {skill.id}"]
+        if missing_tools:
+            rows.append("Missing required tools: " + ", ".join(missing_tools))
+        if missing_env:
+            rows.append("Missing required env vars: " + ", ".join(missing_env))
+        rows.append("Tip: enable matching MCP/custom tools or adjust allow/deny settings.")
+        return False, "\n".join(rows)
+
+    def _recover_after_tool_repeat_abort(
+        self,
+        session_id: str,
+        user_prompt: str,
+        repeat_abort_reason: str,
+        tool_calls: Sequence[dict[str, Any]],
+        tool_results: Sequence[dict[str, Any]],
+    ) -> Optional[str]:
+        """
+        When a run is aborted due to repeated identical tool calls, perform one
+        no-tool recovery model pass so the assistant can still provide a useful
+        response or ask for a precise follow-up.
+        """
+
+        def _clip(text: Any, limit: int = 280) -> str:
+            raw = str(text or "").strip().replace("\n", " ")
+            if len(raw) <= limit:
+                return raw
+            return raw[:limit] + "..."
+
+        observed_calls = [
+            f"- {str(item.get('name', '')).strip()} args={_clip(json.dumps(item.get('args', {}), ensure_ascii=False))}"
+            for item in list(tool_calls)[-4:]
+        ]
+        observed_results = [
+            f"- {str(item.get('name', '')).strip()} [{('error' if item.get('is_error') else 'ok')}] {_clip(item.get('content', ''))}"
+            for item in list(tool_results)[-4:]
+        ]
+        observed_block = "\n".join(
+            [
+                "Recent tool calls:",
+                *(observed_calls or ["- (none)"]),
+                "Recent tool outputs:",
+                *(observed_results or ["- (none)"]),
+            ]
+        )
+
+        recovery_system = (
+            "You are Pi. The previous run was aborted because the same tool call repeated too many times.\n"
+            "Recovery mode rules:\n"
+            "1) Do not call tools.\n"
+            "2) Give the best possible direct answer from observed context.\n"
+            "3) If information is insufficient, ask one specific follow-up question.\n"
+            "4) Keep the reply concise and actionable."
+        )
+        recovery_user = (
+            f"Original user request:\n{user_prompt}\n\n"
+            f"Abort reason:\n{repeat_abort_reason}\n\n"
+            f"{observed_block}\n\n"
+            "Now provide the user-facing response."
+        )
+        try:
+            self.audit_logger.log(
+                session_id,
+                "tool_repeat_recovery_start",
+                {"reason": repeat_abort_reason},
+            )
+            response = self.model.invoke(
+                [
+                    {"role": "system", "content": recovery_system},
+                    {"role": "user", "content": recovery_user},
+                ]
+            )
+            recovered = extract_text(response).strip()
+            if not recovered:
+                return None
+            self.audit_logger.log(
+                session_id,
+                "tool_repeat_recovery_ok",
+                {"chars": len(recovered)},
+            )
+            return recovered
+        except Exception as e:
+            self.audit_logger.log(
+                session_id,
+                "tool_repeat_recovery_fail",
+                {"error": str(e)},
+            )
+            return None
 
     def _normalize_command(self, command: str) -> str:
         return re.sub(r"\s+", " ", str(command or "").strip())
@@ -1440,23 +2485,130 @@ class OpenClawPiLangChain:
             except Exception as e:
                 return f"Error storing memory entry: {e}"
 
-        return [read, write, edit, ls, find, grep, exec_tool, memory_search, memory_get, memory_store]
+        @tool("todo_read")
+        def todo_read() -> str:
+            """Read the current session todo list. Returns all items with id, status, priority, and content."""
+            items = self._todo_items
+            if not items:
+                return "No todos yet."
+            lines = []
+            for item in items:
+                status_icon = {
+                    "pending": "[ ]",
+                    "in_progress": "[~]",
+                    "completed": "[x]",
+                    "cancelled": "[-]",
+                }.get(item.get("status", "pending"), "[ ]")
+                priority = item.get("priority", "medium")
+                lines.append(
+                    f"{status_icon} [{priority}] #{item['id']} {item['content']}"
+                )
+            return "\n".join(lines)
+
+        @tool("todo_write")
+        def todo_write(todos: str) -> str:
+            """Replace the session todo list. todos is a JSON array of objects with fields:
+            content (str, required), status ('pending'|'in_progress'|'completed'|'cancelled'),
+            priority ('high'|'medium'|'low'). IDs are assigned automatically."""
+            import json as _json
+            try:
+                raw = _json.loads(todos)
+                if not isinstance(raw, list):
+                    return "Error: todos must be a JSON array."
+                valid_statuses = {"pending", "in_progress", "completed", "cancelled"}
+                valid_priorities = {"high", "medium", "low"}
+                new_items = []
+                for i, item in enumerate(raw, start=1):
+                    if not isinstance(item, dict) or not item.get("content"):
+                        return f"Error: item #{i} must have a 'content' field."
+                    status = item.get("status", "pending")
+                    if status not in valid_statuses:
+                        return f"Error: item #{i} has invalid status '{status}'."
+                    priority = item.get("priority", "medium")
+                    if priority not in valid_priorities:
+                        return f"Error: item #{i} has invalid priority '{priority}'."
+                    new_items.append({
+                        "id": i,
+                        "content": str(item["content"]),
+                        "status": status,
+                        "priority": priority,
+                    })
+                self._todo_items = new_items
+                return f"Todo list updated: {len(new_items)} item(s)."
+            except _json.JSONDecodeError as e:
+                return f"Error: Invalid JSON - {e}"
+            except Exception as e:
+                return f"Error updating todos: {e}"
+
+        return [read, write, edit, ls, find, grep, exec_tool, memory_search, memory_get, memory_store, todo_read, todo_write]
 
     def _filter_tools(
         self,
         allowlist: Optional[Sequence[str]] = None,
         denylist: Optional[Sequence[str]] = None,
     ) -> list[Any]:
-        allow = {name.strip().lower() for name in (allowlist or []) if name.strip()}
-        deny = {name.strip().lower() for name in (denylist or []) if name.strip()}
+        allow: set[str] = set()
+        deny: set[str] = set()
+        for name in (allowlist or []):
+            allow.update(_tool_name_keys(str(name)))
+        for name in (denylist or []):
+            deny.update(_tool_name_keys(str(name)))
         tools = self.all_tools
         if allow:
-            tools = [tool_obj for tool_obj in tools if tool_obj.name.lower() in allow]
+            tools = [
+                tool_obj
+                for tool_obj in tools
+                if _tool_name_keys(str(getattr(tool_obj, "name", ""))).intersection(allow)
+            ]
         if deny:
-            tools = [tool_obj for tool_obj in tools if tool_obj.name.lower() not in deny]
+            tools = [
+                tool_obj
+                for tool_obj in tools
+                if not _tool_name_keys(str(getattr(tool_obj, "name", ""))).intersection(deny)
+            ]
         return tools
 
-    def _build_system_prompt(self, tools: Sequence[Any], session_id: str) -> str:
+    def _resolve_plan_policy(self, plan_mode: Optional[str]) -> PlanRuntimePolicy:
+        mode = _normalize_plan_mode(plan_mode or self.config.plan_mode)
+        if mode != "on":
+            return PlanRuntimePolicy(mode="off")
+        return PlanRuntimePolicy(
+            mode="on",
+            forced_deny_tools=("write", "edit", "exec", "memory_store"),
+            skip_skill_precheck_fail=True,
+            disable_legacy_memory_write=True,
+            planner_directive=(
+                "Plan mode is ON (read-only planning mode).\n"
+                "- Do not execute implementation work.\n"
+                "- Do not modify files or run shell commands that change state.\n"
+                "- Provide an actionable execution plan grounded in observed evidence.\n"
+                "- If critical context is missing, ask up to 3 specific follow-up questions."
+            ),
+        )
+
+    def _apply_plan_policy_to_tools(self, tools: Sequence[Any], policy: PlanRuntimePolicy) -> list[Any]:
+        if policy.mode != "on" or not policy.forced_deny_tools:
+            return list(tools)
+        deny_keys: set[str] = set()
+        for name in policy.forced_deny_tools:
+            deny_keys.update(_tool_name_keys(name))
+        return [
+            tool_obj
+            for tool_obj in tools
+            if not _tool_name_keys(str(getattr(tool_obj, "name", ""))).intersection(deny_keys)
+        ]
+
+    def _plan_directive_message(self, policy: PlanRuntimePolicy) -> Optional[dict[str, str]]:
+        if policy.mode != "on" or not policy.planner_directive.strip():
+            return None
+        return {"role": "system", "content": policy.planner_directive.strip()}
+
+    def _build_system_prompt(
+        self,
+        tools: Sequence[Any],
+        session_id: str,
+        skill: Optional[SkillSpec] = None,
+    ) -> str:
         tool_lines = []
         for tool_obj in tools:
             description = getattr(tool_obj, "description", "") or ""
@@ -1479,6 +2631,43 @@ class OpenClawPiLangChain:
             else:
                 memory_status += " Legacy mode active. Automatic memory recall/write is enabled."
         
+        active_tool_names = {getattr(t, "name", "") for t in tools}
+        todo_block = ""
+        if "todo_read" in active_tool_names and "todo_write" in active_tool_names:
+            todo_block = (
+                "\nTask Management:\n"
+                "Use todo_read and todo_write tools VERY frequently to track progress.\n"
+                "- At the start of any multi-step task: create a todo list with todo_write\n"
+                "- Before starting each step: call todo_read to review pending items\n"
+                "- Update status to 'in_progress' when starting, 'completed' when done\n"
+                "- Use todo_write to break large complex tasks into smaller steps\n"
+                "- After every few actions: call todo_read to stay on track\n"
+                "Statuses: pending | in_progress | completed | cancelled\n"
+                "Priorities: high | medium | low\n"
+            )
+
+        skill_block = "Skill: none\n"
+        if skill is not None:
+            workflow = (skill.workflow or "- No workflow provided.").strip()
+            output_format = (skill.output_format or "- No strict output format.").strip()
+            required_tools = ", ".join(skill.required_tools) if skill.required_tools else "-"
+            tool_allow = ", ".join(skill.tool_allow) if skill.tool_allow else "-"
+            tool_deny = ", ".join(skill.tool_deny) if skill.tool_deny else "-"
+            skill_block = (
+                f"Skill: {skill.id} ({skill.name})\n"
+                f"Skill Description: {skill.description}\n"
+                f"Skill API Policy: {skill.api_policy}\n"
+                f"Skill Required Tools: {required_tools}\n"
+                f"Skill Tool Allow: {tool_allow}\n"
+                f"Skill Tool Deny: {tool_deny}\n"
+                "Skill Rules:\n"
+                "- Prefer MCP/custom tools for API access (tool-first).\n"
+                "- If needed and exec is available, curl fallback is allowed.\n"
+                "- Never hardcode secrets/tokens in commands. Use environment variables only.\n"
+                f"Skill Workflow:\n{workflow}\n"
+                f"Skill Output Format:\n{output_format}\n"
+            )
+
         return (
             "You are Pi, a minimal coding agent inspired by OpenClaw's embedded Pi runtime.\n\n"
             "Behavior rules:\n"
@@ -1492,7 +2681,9 @@ class OpenClawPiLangChain:
             "Policy: Sensitive/blocked paths are never accessed by generic file tools.\n\n"
             f"Workspace: {self.workspace_dir}\n"
             f"Session ID: {session_id}\n"
-            f"{memory_status}\n\n"
+            f"{memory_status}\n"
+            f"{todo_block}\n"
+            f"{skill_block}\n"
             "Available tools:\n"
             f"{tool_block}"
         )
@@ -1566,12 +2757,77 @@ class OpenClawPiLangChain:
         callbacks: Optional[PiCallbacks] = None,
         allowlist: Optional[Sequence[str]] = None,
         denylist: Optional[Sequence[str]] = None,
+        skill_name: Optional[str] = None,
+        skill_mode: Optional[str] = None,
+        plan_mode: Optional[str] = None,
     ) -> PiRunResult:
         callbacks = callbacks or NullCallbacks()
         self._active_session_id = session_id
         self._reset_read_budget(session_id)
-        tools = self._filter_tools(allowlist=allowlist, denylist=denylist)
-        system_prompt = self._build_system_prompt(tools, session_id=session_id)
+        self._flush_pending_audit(session_id)
+        plan_policy = self._resolve_plan_policy(plan_mode)
+        selected_skill = self._select_skill(
+            prompt=prompt,
+            skill_name=skill_name,
+            skill_mode=skill_mode,
+            session_id=session_id,
+        )
+        explicit_skill = str(skill_name or self.config.skill_name or "").strip()
+        if explicit_skill and selected_skill is None and _normalize_skill_mode(skill_mode or self.config.skill_mode) != "off":
+            message = f"Requested skill not found: {explicit_skill}"
+            self._clear_read_budget(session_id)
+            return PiRunResult(session_id=session_id, final_text=message)
+        base_tools = self._filter_tools(allowlist=allowlist, denylist=denylist)
+        active_skill = selected_skill
+        tools = list(base_tools)
+        if active_skill is not None:
+            tools = self._apply_skill_tool_policy(tools, active_skill)
+        tools = self._apply_plan_policy_to_tools(tools, plan_policy)
+        if plan_policy.mode == "on":
+            self.audit_logger.log(
+                session_id,
+                "plan_policy_applied",
+                {"mode": plan_policy.mode, "forced_deny": list(plan_policy.forced_deny_tools)},
+            )
+        precheck_notice: Optional[str] = None
+        if active_skill is not None:
+            ok, reason = self._skill_precheck(tools, active_skill)
+            if not ok:
+                if plan_policy.skip_skill_precheck_fail:
+                    self.audit_logger.log(
+                        session_id,
+                        "skill_precheck_skipped_plan_mode",
+                        {"skill_id": active_skill.id, "reason": reason},
+                    )
+                else:
+                    self.audit_logger.log(
+                        session_id,
+                        "skill_precheck_fail",
+                        {"skill_id": active_skill.id, "reason": reason},
+                    )
+                    fallback_message = (
+                        f"{reason}\n"
+                        "Continuing without skill constraints for this turn."
+                    )
+                    callbacks.on_event("custom", {"message": fallback_message})
+                    self.audit_logger.log(
+                        session_id,
+                        "skill_precheck_fallback",
+                        {"skill_id": active_skill.id, "reason": reason},
+                    )
+                    precheck_notice = (
+                        f"Skill precheck failed for '{active_skill.id}'. "
+                        "Proceed without that skill and continue with best-effort tool usage."
+                    )
+                    active_skill = None
+                    tools = self._apply_plan_policy_to_tools(base_tools, plan_policy)
+            else:
+                self.audit_logger.log(
+                    session_id,
+                    "skill_precheck_ok",
+                    {"skill_id": active_skill.id, "tool_count": len(tools)},
+                )
+        system_prompt = self._build_system_prompt(tools, session_id=session_id, skill=active_skill)
         agent = self._create_agent(tools=tools, system_prompt=system_prompt)
 
         history = self.session_store.load(session_id)
@@ -1591,6 +2847,11 @@ class OpenClawPiLangChain:
         failure_digest = self._failure_digest_message(session_id=session_id, limit=3)
         if failure_digest:
             input_messages.append(failure_digest)
+        if precheck_notice:
+            input_messages.append({"role": "system", "content": precheck_notice})
+        plan_directive = self._plan_directive_message(plan_policy)
+        if plan_directive:
+            input_messages.append(plan_directive)
         input_messages.append({"role": "user", "content": prompt})
 
         seen_tool_starts: set[str] = set()
@@ -1599,6 +2860,20 @@ class OpenClawPiLangChain:
         tool_results: list[dict[str, Any]] = []
         partial_chunks: list[str] = []
         final_text = ""
+        repeat_limit = max(1, int(self.config.tool_repeat_limit))
+        tool_call_signature_counts: dict[str, int] = {}
+        repeat_abort_reason: Optional[str] = None
+        stop_stream = False
+
+        def _tool_call_signature(name: Any, args: Any) -> str:
+            tool_name = str(name or "").strip().lower() or "<unknown>"
+            try:
+                encoded_args = json.dumps(args or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            except TypeError:
+                encoded_args = repr(args)
+            if len(encoded_args) > 300:
+                encoded_args = encoded_args[:300] + "..."
+            return f"{tool_name}:{encoded_args}"
 
         for stream_mode, chunk in agent.stream(
             {"messages": input_messages},
@@ -1634,6 +2909,37 @@ class OpenClawPiLangChain:
                                 if call_id in seen_tool_starts:
                                     continue
                                 seen_tool_starts.add(call_id)
+                                signature = _tool_call_signature(call.get("name"), call.get("args", {}))
+                                count = tool_call_signature_counts.get(signature, 0) + 1
+                                tool_call_signature_counts[signature] = count
+                                if count >= repeat_limit:
+                                    repeat_abort_reason = (
+                                        f"Aborted: identical tool call repeated {count} times "
+                                        f"(limit={repeat_limit})."
+                                    )
+                                    callbacks.on_event(
+                                        "custom",
+                                        {
+                                            "message": repeat_abort_reason,
+                                            "tool_name": call.get("name"),
+                                            "args": call.get("args", {}),
+                                            "signature": signature,
+                                        },
+                                    )
+                                    self.audit_logger.log(
+                                        session_id,
+                                        "tool_repeat_abort",
+                                        {
+                                            "reason": repeat_abort_reason,
+                                            "tool_name": call.get("name"),
+                                            "args": call.get("args", {}),
+                                            "signature": signature,
+                                            "repeat_count": count,
+                                            "repeat_limit": repeat_limit,
+                                        },
+                                    )
+                                    stop_stream = True
+                                    break
                                 item = {
                                     "id": call.get("id"),
                                     "name": call.get("name"),
@@ -1642,6 +2948,8 @@ class OpenClawPiLangChain:
                                 tool_calls.append(item)
                                 callbacks.on_tool_start(str(item["name"]), dict(item["args"] or {}))
                                 self.audit_logger.log(session_id, "tool_start", item)
+                            if stop_stream:
+                                break
                         else:
                             candidate = extract_text(message).strip()
                             if candidate:
@@ -1669,8 +2977,21 @@ class OpenClawPiLangChain:
                         tool_results.append(item)
                         callbacks.on_tool_end(str(name), content, is_error)
                         self.audit_logger.log(session_id, "tool_end", item)
+                if stop_stream:
+                    break
+            if stop_stream:
+                break
 
-        if not final_text:
+        if repeat_abort_reason:
+            recovered = self._recover_after_tool_repeat_abort(
+                session_id=session_id,
+                user_prompt=prompt,
+                repeat_abort_reason=repeat_abort_reason,
+                tool_calls=tool_calls,
+                tool_results=tool_results,
+            )
+            final_text = recovered or repeat_abort_reason
+        elif not final_text:
             final_text = "".join(partial_chunks).strip()
 
         updated_history = [
@@ -1684,7 +3005,7 @@ class OpenClawPiLangChain:
             "assistant_final",
             {"text": final_text, "tool_calls": len(tool_calls), "tool_results": len(tool_results)},
         )
-        if mode != "openclaw":
+        if mode != "openclaw" and not plan_policy.disable_legacy_memory_write:
             self._write_memories(session_id=session_id, prompt=prompt, final_text=final_text)
         self._clear_read_budget(session_id)
 
@@ -1700,14 +3021,18 @@ class OpenClawPiLangChain:
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="OpenClaw Pi-like agent rebuilt with LangChain")
     env_blocked = _split_csv(os.getenv("PI_BLOCKED_PATHS", ""))
+    env_custom_modules = _split_csv(os.getenv("PI_CUSTOM_TOOL_MODULES", ""))
+    mcp_enabled_default = os.getenv("PI_MCP_ENABLED", "true").lower() not in {"0", "false", "no"}
+    skills_enabled_default = os.getenv("PI_SKILLS_ENABLED", "true").lower() not in {"0", "false", "no"}
     default_blocked = env_blocked or list(DEFAULT_BLOCKED_PATHS)
-    parser.add_argument("prompt", help="user prompt")
+    parser.add_argument("prompt", nargs="?", default="", help="user prompt")
     parser.add_argument("--model", default=os.getenv("PI_MODEL", "gpt-4o"))
     parser.add_argument("--workspace", default=os.getenv("PI_WORKSPACE", "."))
     parser.add_argument("--session", default=os.getenv("PI_SESSION", "main"))
     parser.add_argument("--session-dir", default=os.getenv("PI_SESSION_DIR", ".openclaw_pi/sessions"))
     parser.add_argument("--audit-dir", default=os.getenv("PI_AUDIT_DIR", ".openclaw_pi/audit"))
     parser.add_argument("--max-model-calls", type=int, default=int(os.getenv("PI_MAX_MODEL_CALLS", "16")))
+    parser.add_argument("--tool-repeat-limit", type=int, default=int(os.getenv("PI_TOOL_REPEAT_LIMIT", "3")))
     parser.add_argument("--exec-timeout", type=int, default=int(os.getenv("PI_EXEC_TIMEOUT", "60")))
     parser.add_argument("--deny-tool", action="append", default=[t.strip() for t in os.getenv("PI_DENY_TOOL", "").split(",")] if os.getenv("PI_DENY_TOOL") else [])
     parser.add_argument("--allow-tool", action="append", default=[t.strip() for t in os.getenv("PI_ALLOW_TOOL", "").split(",")] if os.getenv("PI_ALLOW_TOOL") else [])
@@ -1723,6 +3048,38 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--memory-embedding-provider", default=os.getenv("PI_MEMORY_EMBEDDING_PROVIDER", "auto"))
     parser.add_argument("--memory-embedding-model", default=os.getenv("PI_MEMORY_EMBEDDING_MODEL", "text-embedding-3-small"))
     parser.add_argument("--read-strategy", default=os.getenv("PI_READ_STRATEGY", "smart"))
+    parser.add_argument(
+        "--custom-tool-module",
+        action="append",
+        default=env_custom_modules,
+        help="Python module reference or .py file path to load custom tools (repeatable)",
+    )
+    parser.add_argument(
+        "--no-mcp",
+        action="store_true",
+        default=False,
+        help="Disable MCP server tool loading",
+    )
+    parser.add_argument("--mcp-enabled", action="store_true", default=mcp_enabled_default)
+    parser.add_argument("--mcp-config", default=os.getenv("PI_MCP_CONFIG", "mcp_servers.json"))
+    parser.add_argument(
+        "--mcp-fail-fast",
+        action="store_true",
+        default=os.getenv("PI_MCP_FAIL_FAST", "false").lower() in {"1", "true", "yes"},
+        help="Fail startup when any enabled MCP server fails to connect",
+    )
+    parser.add_argument("--mcp-timeout", type=int, default=int(os.getenv("PI_MCP_TIMEOUT", "20")))
+    parser.add_argument(
+        "--no-skills",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument("--skills-enabled", action="store_true", default=skills_enabled_default)
+    parser.add_argument("--skills-dir", default=os.getenv("PI_SKILLS_DIR", "skills"))
+    parser.add_argument("--skill-mode", default=os.getenv("PI_SKILL_MODE", "auto"), choices=["auto", "manual", "off"])
+    parser.add_argument("--skill", default=os.getenv("PI_SKILL", ""))
+    parser.add_argument("--plan-mode", default=os.getenv("PI_PLAN_MODE", "off"), choices=["on", "off"])
+    parser.add_argument("--list-skills", action="store_true")
     parser.add_argument(
         "--exec-path-correction",
         action="store_true",
@@ -1740,6 +3097,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         session_dir=args.session_dir,
         audit_dir=args.audit_dir,
         max_model_calls=args.max_model_calls,
+        tool_repeat_limit=max(1, int(args.tool_repeat_limit)),
         exec_timeout_s=args.exec_timeout,
         allow_write=not args.no_write,
         allow_shell=not args.no_shell,
@@ -1753,17 +3111,47 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         memory_embedding_provider=args.memory_embedding_provider,
         memory_embedding_model=args.memory_embedding_model,
         read_strategy=args.read_strategy,
+        custom_tool_modules=[x for x in (args.custom_tool_module or []) if str(x).strip()],
+        mcp_enabled=bool(args.mcp_enabled) and not args.no_mcp,
+        mcp_config_path=args.mcp_config,
+        mcp_fail_fast=args.mcp_fail_fast,
+        mcp_timeout_s=max(1, int(args.mcp_timeout)),
+        skills_enabled=bool(args.skills_enabled) and not args.no_skills,
+        skills_dir=args.skills_dir,
+        skill_mode=args.skill_mode,
+        skill_name=(str(args.skill).strip() or None),
+        plan_mode=args.plan_mode,
         enable_exec_path_correction=args.exec_path_correction,
         blocked_paths=[x for x in (args.blocked_path or []) if str(x).strip()],
     )
     agent = OpenClawPiLangChain(config)
-    result = agent.run(
-        session_id=args.session,
-        prompt=args.prompt,
-        callbacks=ConsoleCallbacks(),
-        allowlist=args.allow_tool,
-        denylist=args.deny_tool,
-    )
+    try:
+        if args.list_skills:
+            skills = agent.list_skills()
+            if not skills:
+                print("No skills found.")
+            else:
+                for row in skills:
+                    print(
+                        f"- {row['id']} :: {row['name']} | triggers={','.join(row['triggers']) or '-'} "
+                        f"| required_tools={','.join(row['required_tools']) or '-'} "
+                        f"| required_env={','.join(row['required_env']) or '-'}"
+                    )
+            return 0
+        if not str(args.prompt).strip():
+            raise SystemExit("prompt is required unless --list-skills is used")
+        result = agent.run(
+            session_id=args.session,
+            prompt=args.prompt,
+            callbacks=ConsoleCallbacks(),
+            allowlist=args.allow_tool,
+            denylist=args.deny_tool,
+            skill_name=(str(args.skill).strip() or None),
+            skill_mode=args.skill_mode,
+            plan_mode=args.plan_mode,
+        )
+    finally:
+        agent.close()
     print("\n\n--- final ---")
     print(result.final_text)
     if result.audit_file:
