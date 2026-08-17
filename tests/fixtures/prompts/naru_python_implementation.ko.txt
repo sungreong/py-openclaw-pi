@@ -1,0 +1,16 @@
+회사 코딩 가이드를 따라 다음 Python 기능을 구현해줘.
+
+작업 경로:
+- 구현: artifacts/naru-python-guide-eval-v3-20260815/deadline.py
+- 테스트: artifacts/naru-python-guide-eval-v3-20260815/test_deadline.py
+
+요구사항:
+- 공개 함수 build_deadline(seconds, clock)를 제공한다.
+- 반환값은 계산된 만료 시각을 담는다.
+- seconds가 음수면 회사 도메인 오류로 거부한다.
+- clock이 잘못된 시각을 반환하면 회사 도메인 오류로 거부한다.
+- 성공, 0초 경계, 음수, 잘못된 clock을 테스트한다.
+- 해당 테스트를 실제 실행하고 결과를 보고한다.
+- 요청과 관계없는 파일은 수정하지 마라.
+
+구현 전에 회사 정책 reference를 읽고 최종 답변에 적용한 정책 ID를 적어라.

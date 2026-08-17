@@ -1,0 +1,126 @@
+{
+  "name": "PiAgent GPT-OSS-120B multi-turn evaluation",
+  "version": 1,
+  "scenario_count": 10,
+  "scenarios": [
+    {
+      "id": "M01",
+      "level": 1,
+      "title": "기본 사실 누적",
+      "allowlist": ["__no_tools__"],
+      "turns": [
+        {"prompt": "이 대화의 프로젝트는 ORBIT-42이고 담당자는 민아, 마감은 금요일입니다. 세 값을 모두 확인해 답하세요.", "checks": [{"type": "final_contains_all", "values": ["ORBIT-42", "민아", "금요일"]}]},
+        {"prompt": "담당자만 지수로 변경합니다. 현재 상태만 쓰고 이전 담당자는 쓰지 마세요.", "checks": [{"type": "final_contains_all", "values": ["ORBIT-42", "지수", "금요일"]}, {"type": "final_not_contains", "value": "민아"}]},
+        {"prompt": "현재 프로젝트, 담당자, 마감을 '프로젝트|담당자|마감' 한 줄로 답하세요.", "checks": [{"type": "final_contains_all", "values": ["ORBIT-42", "지수", "금요일"]}]}
+      ]
+    },
+    {
+      "id": "M02",
+      "level": 1,
+      "title": "출력 제약 누적과 수정",
+      "allowlist": ["__no_tools__"],
+      "turns": [
+        {"prompt": "이 세션에서 보고서는 한국어로 작성해야 합니다. 이해한 규칙만 답하세요.", "checks": [{"type": "final_contains", "value": "한국어"}]},
+        {"prompt": "형식은 표로 추가하고 위험 라벨은 처음에는 ORANGE로 정합니다. 현재 규칙을 답하세요.", "checks": [{"type": "final_contains_all", "values": ["한국어", "표", "ORANGE"]}]},
+        {"prompt": "위험 라벨을 RED로 정정합니다. 현재 규칙만 정확히 '언어=한국어; 형식=표; 위험=RED'로 답하세요.", "checks": [{"type": "final_contains", "value": "언어=한국어; 형식=표; 위험=RED"}, {"type": "final_not_contains", "value": "ORANGE"}]}
+      ]
+    },
+    {
+      "id": "M03",
+      "level": 2,
+      "title": "파일 Tool 결과의 후속 참조",
+      "allowlist": ["read"],
+      "turns": [
+        {"allowlist": ["read"], "prompt": "`{work_rel}/multiturn/project.md`를 read로 읽고 담당팀만 답하세요.", "checks": [{"type": "required_tools_all", "values": ["read"]}, {"type": "final_contains", "value": "Blue Team"}]},
+        {"allowlist": ["__no_tools__"], "prompt": "그 프로젝트의 예산 숫자만 답하세요. 앞선 대화의 근거를 사용하세요.", "checks": [{"type": "final_contains", "value": "900"}]},
+        {"allowlist": ["__no_tools__"], "prompt": "마지막으로 그 프로젝트의 코드명만 답하세요.", "checks": [{"type": "final_contains", "value": "ATLAS-900"}]}
+      ]
+    },
+    {
+      "id": "M04",
+      "level": 2,
+      "title": "대명사와 순서 지시",
+      "allowlist": ["__no_tools__"],
+      "turns": [
+        {"prompt": "서비스 두 개를 기억하세요. 첫 번째 api 포트는 8080, 두 번째 worker 포트는 9090입니다. 확인해 답하세요.", "checks": [{"type": "final_contains_all", "values": ["api", "8080", "worker", "9090"]}]},
+        {"prompt": "두 번째 것의 포트를 9191로 바꾸세요. 현재 두 번째 서비스만 답하세요.", "checks": [{"type": "final_contains_all", "values": ["worker", "9191"]}]},
+        {"prompt": "현재 포트를 정확히 'api=8080; worker=9191' 한 줄로 답하세요.", "checks": [{"type": "final_contains", "value": "api=8080; worker=9191"}]}
+      ]
+    },
+    {
+      "id": "M05",
+      "level": 2,
+      "title": "결정 변경과 최신 지시 우선",
+      "allowlist": ["__no_tools__"],
+      "turns": [
+        {"prompt": "온라인 주문 서비스의 데이터베이스로 PostgreSQL을 선택합니다. 선택 사항을 확인하세요.", "checks": [{"type": "final_contains", "value": "PostgreSQL"}]},
+        {"prompt": "새 제약이 생겼습니다. 완전 오프라인 단일 사용자 앱이므로 선택을 SQLite로 변경하세요. 현재 선택만 답하세요.", "checks": [{"type": "final_contains", "value": "SQLite"}]},
+        {"prompt": "최종 선택을 정확히 'DB=SQLite'로만 답하고 과거 선택은 언급하지 마세요.", "checks": [{"type": "final_contains", "value": "DB=SQLite"}, {"type": "final_not_contains", "value": "PostgreSQL"}]}
+      ]
+    },
+    {
+      "id": "M06",
+      "level": 3,
+      "title": "여러 턴에 걸친 산출물 편집",
+      "allowlist": ["read", "write", "edit"],
+      "turns": [
+        {"allowlist": ["write"], "prompt": "존재 여부를 확인하지 말고 write를 바로 사용해 `{work_rel}/outputs/multiturn-note.md`를 만들고 '# MT-SUN' 제목과 '상태: 초안'을 넣으세요.", "checks": [{"type": "required_tools_all", "values": ["write"]}, {"type": "file_text_contains", "path": "{work_rel}/outputs/multiturn-note.md", "values": ["MT-SUN", "상태: 초안"]}]},
+        {"allowlist": ["edit"], "prompt": "방금 만든 문서에 담당팀이 Team Blue라는 내용을 추가하고 상태를 검토중으로 바꾸세요. edit를 실제 사용하세요.", "checks": [{"type": "required_tools_all", "values": ["edit"]}, {"type": "file_text_contains", "path": "{work_rel}/outputs/multiturn-note.md", "values": ["Team Blue", "상태: 검토중"]}]},
+        {"allowlist": ["read"], "prompt": "read로 같은 문서를 검증하고 코드명, 담당팀, 현재 상태를 답하세요.", "checks": [{"type": "required_tools_all", "values": ["read"]}, {"type": "final_contains_all", "values": ["MT-SUN", "Team Blue", "검토중"]}]}
+      ]
+    },
+    {
+      "id": "M07",
+      "level": 3,
+      "title": "질문 중단과 응답 후 재개",
+      "allowlist": ["ask_user", "read", "write"],
+      "turns": [
+        {"allowlist": ["ask_user"], "prompt": "운영 대시보드 문서를 만들어 주세요. 출력 형식이 정해지지 않았으므로 작업하지 말고 ask_user로 Markdown 또는 Word 중 하나를 질문하세요.", "checks": [{"type": "required_tools_all", "values": ["ask_user"]}, {"type": "awaiting_user_input", "value": true}]},
+        {"allowlist": ["write"], "prompt": "Markdown으로 해주세요. 존재 여부를 확인하지 말고 write를 바로 사용해 `{work_rel}/outputs/dashboard.md`에 '# 운영 대시보드'와 '형식: Markdown'을 작성하세요.", "checks": [{"type": "required_tools_all", "values": ["write"]}, {"type": "file_text_contains", "path": "{work_rel}/outputs/dashboard.md", "values": ["운영 대시보드", "형식: Markdown"]}]},
+        {"allowlist": ["read"], "prompt": "read로 결과를 확인하고 선택된 형식만 답하세요.", "checks": [{"type": "required_tools_all", "values": ["read"]}, {"type": "final_contains", "value": "Markdown"}]}
+      ]
+    },
+    {
+      "id": "M08",
+      "level": 4,
+      "title": "Plan Mode에서 실행 모드로 전환",
+      "allowlist": ["read", "write", "edit"],
+      "turns": [
+        {"allowlist": ["read"], "plan_mode": "on", "prompt": "`{work_rel}/multiturn/release.md`를 읽고 릴리스 체크리스트 작성 계획만 제안하세요. 파일은 수정하지 마세요.", "checks": [{"type": "required_tools_all", "values": ["read"]}, {"type": "forbidden_tools", "values": ["write", "edit", "exec"]}]},
+        {"allowlist": ["write"], "plan_mode": "off", "prompt": "계획을 승인합니다. write를 사용해 `{work_rel}/outputs/release-checklist.md`에 Smoke test와 Rollback 두 항목을 작성하세요.", "checks": [{"type": "required_tools_all", "values": ["write"]}, {"type": "file_text_contains", "path": "{work_rel}/outputs/release-checklist.md", "values": ["Smoke test", "Rollback"]}]},
+        {"allowlist": ["read"], "prompt": "read로 체크리스트를 확인하고 두 항목을 답하세요.", "checks": [{"type": "required_tools_all", "values": ["read"]}, {"type": "final_contains_all", "values": ["Smoke test", "Rollback"]}]}
+      ]
+    },
+    {
+      "id": "M09",
+      "level": 4,
+      "title": "내부 Pi 서브에이전트 결과 이어받기",
+      "allowlist": ["delegate_task"],
+      "turns": [
+        {"allowlist": ["delegate_task"], "prompt": "delegate_task를 반드시 사용해 explore 서브에이전트에게 `{work_rel}/multiturn/subagent.txt`를 조사시키고 발견한 marker를 답하세요.", "checks": [{"type": "required_tools_all", "values": ["delegate_task"]}, {"type": "final_contains", "value": "DELTA-88"}]},
+        {"allowlist": ["__no_tools__"], "prompt": "방금 하위 에이전트가 발견한 marker와 사용한 하위 에이전트 유형을 답하세요. 다시 파일을 읽지 마세요.", "checks": [{"type": "final_contains_all", "values": ["DELTA-88", "explore"]}, {"type": "forbidden_tools", "values": ["read"]}]},
+        {"allowlist": ["__no_tools__"], "prompt": "최종 결과를 정확히 'subagent=explore; marker=DELTA-88' 한 줄로 답하세요.", "checks": [{"type": "final_contains", "value": "subagent=explore; marker=DELTA-88"}]}
+      ]
+    },
+    {
+      "id": "M10",
+      "level": 5,
+      "title": "압축 이후 10턴 상태 유지",
+      "allowlist": ["__no_tools__"],
+      "compact_after_messages": 8,
+      "keep_last_messages": 4,
+      "turns": [
+        {"prompt": "장기 대화 상태 1: 코드명은 COMET-10입니다. 확인하세요.", "checks": [{"type": "final_contains", "value": "COMET-10"}]},
+        {"prompt": "상태 2: 담당자는 하늘입니다. 확인하세요.", "checks": [{"type": "final_contains", "value": "하늘"}]},
+        {"prompt": "상태 3: 마감일은 2026-09-30입니다. 확인하세요.", "checks": [{"type": "final_contains", "value": "2026-09-30"}]},
+        {"prompt": "상태 4: 위험도는 MEDIUM입니다. 확인하세요.", "checks": [{"type": "final_contains", "value": "MEDIUM"}]},
+        {"prompt": "정정 1: 담당자를 지수로 변경합니다. 현재 담당자만 답하세요.", "checks": [{"type": "final_contains", "value": "지수"}]},
+        {"prompt": "정정 2: 위험도를 HIGH로 변경합니다. 현재 위험도만 답하세요.", "checks": [{"type": "final_contains", "value": "HIGH"}]},
+        {"prompt": "출력 언어는 한국어로 정합니다. 확인하세요.", "checks": [{"type": "final_contains", "value": "한국어"}]},
+        {"prompt": "현재 코드명과 마감일만 답하세요.", "checks": [{"type": "final_contains_all", "values": ["COMET-10", "2026-09-30"]}]},
+        {"prompt": "현재 담당자와 위험도만 답하세요.", "checks": [{"type": "final_contains_all", "values": ["지수", "HIGH"]}]},
+        {"prompt": "전체 최신 상태를 정확히 'COMET-10|지수|2026-09-30|HIGH|한국어' 한 줄로 답하세요.", "checks": [{"type": "final_contains", "value": "COMET-10|지수|2026-09-30|HIGH|한국어"}, {"type": "history_has_summary", "value": true}]}
+      ]
+    }
+  ]
+}

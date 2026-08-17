@@ -1,7 +1,7 @@
 ---
 id: data-report-writer
 name: data-report-writer
-description: Create evidence-based markdown reports from local data files by running the skill's Python profiler script first, then saving to reports/.
+description: Create evidence-based markdown reports from local data files by running the skill's Python profiler script first, then saving to user-isolated artifact paths.
 triggers:
   - summary report
   - markdown report
@@ -13,10 +13,12 @@ triggers:
   - 마크다운 보고서
 required_tools:
   - exec
+  - python_package_install
   - read
   - write
 tool_allow:
   - exec
+  - python_package_install
   - read
   - find
   - ls
@@ -36,9 +38,13 @@ Execution flow:
 5. Optionally use `read` for a small targeted preview only when needed.
 6. Build report content from observed facts only (script output + verified file preview).
 7. Save markdown report:
-   - default: `reports/<source_stem>-summary.md`
-   - if exists: `reports/<source_stem>-summary-2.md` (and increment)
-8. Return:
+   - if `PI_USER_ID` is set: `artifacts/users/<PI_USER_ID>/reports/<source_stem>-summary.md`
+   - otherwise: `reports/<source_stem>-summary.md`
+   - if exists: append `-2`, `-3`, ... before `.md`
+   - when the user supplies an exact workspace output path, use that path instead of the default above
+   - `write` creates missing parent directories; do not preflight a new output directory with `ls` and do not call `exec` only to create it
+8. Verify the saved file with `ls` or `read` only after `write` succeeds.
+9. Return:
    - source path
    - saved report path
    - 3-5 key highlights

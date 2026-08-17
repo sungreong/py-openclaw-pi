@@ -1,0 +1,4 @@
+interface:
+  display_name: "Code Health Check"
+  short_description: "Create an evidence-based project health report"
+  default_prompt: "Use $code-health-check to inspect this project and save a code health report."

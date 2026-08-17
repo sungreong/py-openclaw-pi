@@ -1,0 +1,319 @@
+{
+  "schema_version": 1,
+  "title": "PiAgent 20-task capability evaluation",
+  "tasks": [
+    {
+      "id": "T01",
+      "level": 1,
+      "title": "기초 산술",
+      "capability": "도구 없는 정확한 계산",
+      "session": "basic-math",
+      "max_model_calls": 2,
+      "prompt": "도구를 사용하지 말고 계산하세요. (17 × 23) + 5의 값을 구한 뒤 최종 답변을 정확히 '정답: <숫자>' 한 줄로 작성하세요.",
+      "checks": [
+        {"type": "final_contains", "value": "정답: 396"},
+        {"type": "tool_count_max", "value": 0},
+        {"type": "no_tool_errors"}
+      ]
+    },
+    {
+      "id": "T02",
+      "level": 1,
+      "title": "구조화 정렬",
+      "capability": "간단한 구조화 출력",
+      "session": "basic-structure",
+      "max_model_calls": 2,
+      "prompt": "도구 없이 다음 항목을 priority 오름차순으로 정렬하세요: A=2, B=1, C=3. 각 줄을 '<id>:<priority>' 형식으로 쓰고 설명은 추가하지 마세요.",
+      "checks": [
+        {"type": "final_order", "values": ["B:1", "A:2", "C:3"]},
+        {"type": "tool_count_max", "value": 0},
+        {"type": "no_tool_errors"}
+      ]
+    },
+    {
+      "id": "T03",
+      "level": 1,
+      "title": "디렉터리 탐색",
+      "capability": "워크스페이스 목록 도구",
+      "session": "file-list",
+      "max_model_calls": 4,
+      "prompt": "`{work_rel}` 디렉터리를 ls 도구로 확인하고, 그 안에 있는 항목 이름을 짧게 알려주세요. 추측하지 마세요.",
+      "checks": [
+        {"type": "required_tools_all", "values": ["ls"]},
+        {"type": "final_contains", "value": "brief.md"},
+        {"type": "no_tool_errors"}
+      ]
+    },
+    {
+      "id": "T04",
+      "level": 1,
+      "title": "정확한 파일 질의",
+      "capability": "지정 파일 읽기와 근거 답변",
+      "session": "file-read",
+      "max_model_calls": 4,
+      "prompt": "`{work_rel}/brief.md` 파일을 read 도구로 읽고 프로젝트 코드명만 답하세요.",
+      "checks": [
+        {"type": "required_tools_all", "values": ["read"]},
+        {"type": "final_contains", "value": "ORBIT-42"},
+        {"type": "no_tool_errors"}
+      ]
+    },
+    {
+      "id": "T05",
+      "level": 1,
+      "title": "다중 파일 검색",
+      "capability": "grep 기반 위치 검색",
+      "session": "file-grep",
+      "max_model_calls": 5,
+      "prompt": "grep 도구로 `{work_rel}/notes` 아래에서 `FEATURE_ALPHA`를 찾아 값과 발견된 파일 경로를 모두 알려주세요.",
+      "checks": [
+        {"type": "required_tools_all", "values": ["grep"]},
+        {"type": "final_contains", "value": "enabled"},
+        {"type": "final_contains", "value": "feature.txt"},
+        {"type": "no_tool_errors"}
+      ]
+    },
+    {
+      "id": "T06",
+      "level": 2,
+      "title": "CSV 근거 계산",
+      "capability": "로컬 표 데이터 요약",
+      "session": "csv-summary",
+      "max_model_calls": 5,
+      "prompt": "`{work_rel}/sales.csv`를 읽어 sales 합계와 sales가 가장 큰 region을 계산하세요. 두 값을 표로 답하고 파일에서 확인한 값만 사용하세요.",
+      "checks": [
+        {"type": "required_tools_all", "values": ["read"]},
+        {"type": "final_contains", "value": "60"},
+        {"type": "final_contains", "value": "Busan"},
+        {"type": "no_tool_errors"}
+      ]
+    },
+    {
+      "id": "T07",
+      "level": 2,
+      "title": "Plan Mode 안전성",
+      "capability": "읽기 전용 계획과 변경 차단",
+      "session": "plan-mode",
+      "plan_mode": "on",
+      "max_model_calls": 7,
+      "prompt": "`{work_rel}/plan_target.py`의 divide 함수가 0으로 나눌 때 명확한 ValueError를 내도록 개선하는 구현 계획을 작성하세요. 지금은 절대 수정하거나 테스트를 실행하지 말고 파일을 읽어서 계획만 `<proposed_plan>` 형식으로 답하세요.",
+      "checks": [
+        {"type": "required_tools_all", "values": ["read"]},
+        {"type": "forbidden_tools", "values": ["write", "edit", "multiedit", "exec", "memory_store"]},
+        {"type": "final_contains", "value": "<proposed_plan>"},
+        {"type": "file_text_contains", "path": "{work_rel}/plan_target.py", "value": "return a / b"},
+        {"type": "no_tool_errors"}
+      ]
+    },
+    {
+      "id": "T08",
+      "level": 2,
+      "title": "회사 코딩 스킬 자동 선택",
+      "capability": "SKILL.md 선택과 reference 적용",
+      "session": "skill-auto",
+      "skill_mode": "auto",
+      "max_model_calls": 7,
+      "prompt": "회사 Python 코딩 가이드에 따라 현재 시간 주입 규칙과 실행하지 않은 테스트를 보고하는 규칙을 정책 ID와 함께 알려주세요. 반드시 해당 스킬의 reference를 읽고 답하세요.",
+      "checks": [
+        {"type": "audit_skill_selected", "value": "naru-python-coding-guide"},
+        {"type": "required_tools_all", "values": ["read"]},
+        {"type": "final_contains", "value": "[PY-04]"},
+        {"type": "final_contains", "value": "[PY-09]"},
+        {"type": "no_tool_errors"}
+      ]
+    },
+    {
+      "id": "T09",
+      "level": 2,
+      "title": "세션 정보 저장",
+      "capability": "대화 세션 영속화 준비",
+      "session": "shared-session",
+      "denylist": ["memory_store"],
+      "max_model_calls": 2,
+      "prompt": "이 세션에서 사용할 프로젝트 코드명은 `NEBULA-731`입니다. 장기 메모리 도구에는 저장하지 말고, 이해했다는 답만 하세요.",
+      "checks": [
+        {"type": "final_contains", "value": "NEBULA-731"},
+        {"type": "forbidden_tools", "values": ["memory_store"]},
+        {"type": "no_tool_errors"}
+      ]
+    },
+    {
+      "id": "T10",
+      "level": 2,
+      "title": "동일 세션 재시작 회상",
+      "capability": "새 Agent 인스턴스의 세션 복원",
+      "session": "shared-session",
+      "depends_on": ["T09"],
+      "max_model_calls": 3,
+      "prompt": "앞선 대화에서 정한 프로젝트 코드명은 무엇인가요? 코드명만 답하세요.",
+      "checks": [
+        {"type": "final_contains", "value": "NEBULA-731"},
+        {"type": "no_tool_errors"}
+      ]
+    },
+    {
+      "id": "T11",
+      "level": 3,
+      "title": "다른 세션 조각 참조",
+      "capability": "session_fragment_search/get",
+      "session": "cross-session-reader",
+      "depends_on": ["T09"],
+      "max_model_calls": 8,
+      "prompt": "다른 세션 `{shared_session}`에서 프로젝트 코드명을 찾아주세요. 반드시 session_fragment_search로 검색한 뒤 반환된 ID를 session_fragment_get으로 읽고, 근거가 확인된 코드명만 답하세요.",
+      "checks": [
+        {"type": "required_tools_all", "values": ["session_fragment_search", "session_fragment_get"]},
+        {"type": "final_contains", "value": "NEBULA-731"},
+        {"type": "no_tool_errors"}
+      ]
+    },
+    {
+      "id": "T12",
+      "level": 3,
+      "title": "장기 메모리 저장",
+      "capability": "memory_store",
+      "session": "memory-writer",
+      "max_model_calls": 5,
+      "prompt": "사용자 선호를 장기 기억에 저장하세요: '상태 보고서는 한국어 표 형식으로 작성하고 위험 항목에는 반드시 RED 라벨을 붙인다.' memory_store를 한 번 호출하고 저장 결과를 알려주세요.",
+      "checks": [
+        {"type": "required_tools_all", "values": ["memory_store"]},
+        {"type": "tool_result_contains", "tool": "memory_store", "value": "Stored memory"},
+        {"type": "no_tool_errors"}
+      ]
+    },
+    {
+      "id": "T13",
+      "level": 3,
+      "title": "새 세션 장기 메모리 검색",
+      "capability": "memory_search/get",
+      "session": "memory-reader",
+      "depends_on": ["T12"],
+      "max_model_calls": 8,
+      "prompt": "새 세션입니다. 사용자의 상태 보고서 형식 선호를 memory_search로 찾고, 결과 ID를 memory_get으로 읽은 다음 선호 내용을 요약하세요.",
+      "checks": [
+        {"type": "required_tools_all", "values": ["memory_search", "memory_get"]},
+        {"type": "final_contains", "value": "RED"},
+        {"type": "final_contains", "value": "한국어"},
+        {"type": "no_tool_errors"}
+      ]
+    },
+    {
+      "id": "T14",
+      "level": 3,
+      "title": "데이터 보고서 작성",
+      "capability": "스킬 기반 다중 Tool과 Markdown 산출물",
+      "session": "data-report",
+      "skill": "data-report-writer",
+      "skill_mode": "manual",
+      "max_model_calls": 12,
+      "prompt": "`{work_rel}/sales.csv`를 분석해 `{work_rel}/outputs/sales-report.md`에 한국어 Markdown 보고서를 작성하세요. data-report-writer 스킬 절차에 따라 profiler를 먼저 실행하고, 실제 합계와 최대 지역을 포함한 뒤 파일 존재를 확인하세요.",
+      "checks": [
+        {"type": "audit_skill_selected", "value": "data-report-writer"},
+        {"type": "required_tools_all", "values": ["exec", "write"]},
+        {"type": "artifact_text_contains", "path": "{work_rel}/outputs/sales-report.md", "values": ["60", "Busan"]},
+        {"type": "no_tool_errors"}
+      ]
+    },
+    {
+      "id": "T15",
+      "level": 3,
+      "title": "회사 규칙 기반 코드 리뷰",
+      "capability": "reference 기반 정적 리뷰",
+      "session": "code-review",
+      "skill": "naru-python-coding-guide",
+      "skill_mode": "manual",
+      "max_model_calls": 12,
+      "prompt": "`{work_rel}/review/legacy.py`를 회사 Python 코딩 가이드로 리뷰하고 원본은 수정하지 마세요. 정책 ID가 포함된 리뷰를 `{work_rel}/outputs/code-review.md`에 저장하고 파일을 확인하세요.",
+      "checks": [
+        {"type": "audit_skill_selected", "value": "naru-python-coding-guide"},
+        {"type": "required_tools_all", "values": ["read", "write"]},
+        {"type": "forbidden_tools", "values": ["edit", "multiedit"]},
+        {"type": "artifact_text_contains", "path": "{work_rel}/outputs/code-review.md", "values": ["PY-04", "PY-07"]},
+        {"type": "file_text_contains", "path": "{work_rel}/review/legacy.py", "value": "datetime.now()"},
+        {"type": "no_tool_errors"}
+      ]
+    },
+    {
+      "id": "T16",
+      "level": 4,
+      "title": "버그 수정과 테스트",
+      "capability": "코드 편집·명령 실행·독립 검증",
+      "session": "bug-fix",
+      "max_model_calls": 14,
+      "prompt": "`{work_rel}/bugfix/calculator.py`와 테스트를 읽고 실패 원인을 찾아 최소 수정하세요. 경계값 버그를 고친 뒤 `python -m pytest {work_rel}/bugfix -q`를 실행하고 결과를 보고하세요. 관련 없는 파일은 변경하지 마세요.",
+      "checks": [
+        {"type": "required_tools_all", "values": ["read", "exec"]},
+        {"type": "required_tools_any", "values": ["edit", "write", "multiedit"]},
+        {"type": "external_pytest", "path": "{work_rel}/bugfix"},
+        {"type": "file_text_contains", "path": "{work_rel}/bugfix/calculator.py", "value": "requested > stock"},
+        {"type": "no_tool_errors"}
+      ]
+    },
+    {
+      "id": "T17",
+      "level": 4,
+      "title": "Git 정책 기반 상태 분석",
+      "capability": "읽기 전용 Git Skill",
+      "session": "git-review",
+      "skill": "naru-git-workflow",
+      "skill_mode": "manual",
+      "max_model_calls": 10,
+      "prompt": "현재 저장소의 변경 상태를 회사 Git 정책에 따라 읽기 전용으로 검토하세요. 정책 reference를 읽고 정확히 `git status --short`만 실행해 브랜치명, 커밋 제목, PR 체크리스트를 제안하세요. 파일 수정이나 Git 변경은 금지합니다.",
+      "checks": [
+        {"type": "audit_skill_selected", "value": "naru-git-workflow"},
+        {"type": "required_tools_all", "values": ["read", "exec_readonly"]},
+        {"type": "forbidden_tools", "values": ["exec", "write", "edit", "multiedit"]},
+        {"type": "final_contains", "value": "[GIT-04]"},
+        {"type": "final_contains", "value": "[GIT-05]"},
+        {"type": "no_tool_errors"}
+      ]
+    },
+    {
+      "id": "T18",
+      "level": 4,
+      "title": "최근 베트남-한국 뉴스 근거 검색",
+      "capability": "외부 검색 Tool과 근거 URL 검증",
+      "session": "news-research",
+      "skill": "news-research-report",
+      "skill_mode": "manual",
+      "max_model_calls": 16,
+      "prompt": "현재 날짜 기준 최근 30일의 베트남과 한국 관련 공개 뉴스 후보를 조사하세요. news_research_bundle로 영어·베트남어·한국어 검색을 수행하고, 최소 2개 후보의 evidence_id와 정확한 URL을 news_evidence_validate로 검증하세요. 결과가 부족하면 부족하다고 명시하고, 검증된 후보만 제목·발행처·날짜·URL 표로 답하세요. 보고서 파일은 만들지 마세요.",
+      "checks": [
+        {"type": "audit_skill_selected", "value": "news-research-report"},
+        {"type": "required_tools_all", "values": ["news_research_bundle", "news_evidence_validate"]},
+        {"type": "final_contains", "value": "http"},
+        {"type": "no_tool_errors"}
+      ]
+    },
+    {
+      "id": "T19",
+      "level": 4,
+      "title": "Word 보고서 생성",
+      "capability": "Markdown→DOCX Tool과 구조 검증",
+      "session": "word-report",
+      "max_model_calls": 8,
+      "prompt": "`{work_rel}/word-source.md`를 읽고 word_report_create 도구를 사용해 `{work_rel}/outputs/word-report.docx`를 만드세요. 임의 Python 변환 코드는 작성하지 말고, 생성 후 ls로 존재를 확인해 결과를 보고하세요.",
+      "checks": [
+        {"type": "required_tools_all", "values": ["word_report_create", "ls"]},
+        {"type": "artifact_docx", "path": "{work_rel}/outputs/word-report.docx", "min_bytes": 1000},
+        {"type": "tool_result_contains", "tool": "word_report_create", "value": "\"status\": \"ok\""},
+        {"type": "no_tool_errors"}
+      ]
+    },
+    {
+      "id": "T20",
+      "level": 5,
+      "title": "세션·메모리·문서 복합 작업",
+      "capability": "다른 세션과 장기 기억을 결합한 DOCX 완주",
+      "session": "capstone",
+      "depends_on": ["T12", "T18"],
+      "max_model_calls": 20,
+      "prompt": "복합 작업입니다. (1) memory_search 후 memory_get으로 상태 보고서 선호를 확인하고, (2) 다른 세션 `{news_session}`을 session_fragment_search 후 session_fragment_get으로 읽어 뉴스 조사 결과를 확인하세요. (3) 확인된 정보만 사용해 `{work_rel}/outputs/capstone.md`에 한국어 상태 보고서를 작성하세요. 표 형식과 RED 위험 라벨을 적용하고, 뉴스 근거가 부족하거나 URL을 확인할 수 없으면 명확히 제한으로 쓰세요. (4) word_report_create로 `{work_rel}/outputs/capstone.docx`를 만들고 ls로 두 파일을 확인하세요. 각 단계는 실제 Tool 결과가 있어야 완료입니다.",
+      "checks": [
+        {"type": "required_tools_all", "values": ["memory_search", "memory_get", "session_fragment_search", "session_fragment_get", "write", "word_report_create", "ls"]},
+        {"type": "artifact_text_contains", "path": "{work_rel}/outputs/capstone.md", "values": ["RED", "제한"]},
+        {"type": "artifact_docx", "path": "{work_rel}/outputs/capstone.docx", "min_bytes": 1000},
+        {"type": "no_tool_errors"}
+      ]
+    }
+  ]
+}

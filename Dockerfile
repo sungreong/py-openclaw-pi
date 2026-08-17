@@ -12,5 +12,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY requirements-openclaw-pi-langchain.txt /tmp/
-RUN pip install -r /tmp/requirements-openclaw-pi-langchain.txt
+COPY requirements-piagent.lock.txt requirements-piagent-documents.txt /tmp/
+RUN python -m pip install --upgrade pip \
+    && python -m pip install -r /tmp/requirements-piagent.lock.txt \
+    && python -m pip install -r /tmp/requirements-piagent-documents.txt
+
+# Keep the image runnable without the development bind mount. Sensitive and
+# generated paths are excluded by .dockerignore.
+COPY . /app

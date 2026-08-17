@@ -14,3 +14,9 @@ services:
     # .env 파일로 환경 변수 주입
     env_file:
       - .env
+    environment:
+      # Keep Python's text streams in UTF-8 when attached through Docker Desktop.
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
+      # Docker Desktop reaches the already-running host Markdown Search MCP here.
+      PI_MARKDOWN_SEARCH_MCP_URL: ${PI_MARKDOWN_SEARCH_MCP_URL:-http://host.docker.internal:8811/mcp}

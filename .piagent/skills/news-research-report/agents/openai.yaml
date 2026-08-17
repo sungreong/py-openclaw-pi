@@ -1,0 +1,4 @@
+interface:
+  display_name: "News Research Report"
+  short_description: "Recent news research with evidence gates"
+  default_prompt: "Use $news-research-report to research recent news and write a sourced report."
