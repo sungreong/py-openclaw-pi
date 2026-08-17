@@ -28,7 +28,6 @@ flowchart LR
 | 파일 | 책임 |
 | --- | --- |
 | `piagent/markdown_loop.py` | LangGraph 상태, MCP 어댑터, writer/verifier, 종료 정책 |
-| `markdown_loop.py` | 최소 CLI 실행기와 환경 설정 |
 | `tests/test_markdown_loop.py` | 반복·실패·MCP·Bedrock HTTP 계약 검증 |
 
 ## 구현된 품질 게이트
@@ -41,35 +40,19 @@ flowchart LR
 | 도구 실패 | MCP 검색·읽기 예외 | `error` |
 | 모델 출력 실패 | verifier JSON 파싱 또는 타입 검증 실패 | `error` |
 
-Writer와 verifier는 별도 객체와 별도 모델 호출로 구성한다. CLI도 모델 인스턴스를 둘로 초기화한다. 다만 기본 설정에서는 두 역할이 같은 모델 ID를 사용하므로, 공급자·모델까지 완전히 독립된 교차 검증은 아니다.
+Writer와 verifier는 별도 객체와 별도 모델 호출로 구성한다. 다만 기본 설정에서는 두 역할이 같은 모델 ID를 사용하므로, 공급자·모델까지 완전히 독립된 교차 검증은 아니다.
 
-## 최소 실행 조건
+## 현재 노출 범위와 검증
 
-Python 의존성은 기존 `requirements-piagent-minimal.txt`의 9개 직접 핀으로 충분하다. 별도 검색 SDK를 추가하지 않았고 기존 stdio MCP 클라이언트를 재사용한다.
+`markdown_loop.py`라는 루트 CLI 실행기는 제거되었다. 현재 이 기능은 `piagent/markdown_loop.py`의 재사용 모듈이며, 사용자용 PiAgent 런처나 기본 채팅 명령에서 직접 노출하지 않는다. 따라서 별도 MCP 서버를 연결해 루프를 실행하려는 개발자는 이 모듈을 자신의 통합 코드에서 호출해야 한다.
 
-필수 외부 조건은 두 가지다.
-
-1. `search_markdown`, `read_markdown`을 제공하는 stdio MCP 서버의 실행 명령
-2. OpenAI API 설정 또는 `LOCAL_BEDROCK_*` 3개 환경변수
-
-구조만 확인하는 명령은 모델과 MCP 서버를 호출하지 않는다.
+이 저장소가 제공하는 검증 경로는 다음과 같다.
 
 ```powershell
-python markdown_loop.py --check
+python -m pytest tests/test_markdown_loop.py -q
 ```
 
-실제 실행 예시는 다음과 같다. 저장소에는 `markdown_search` 서버 자체가 포함되어 있지 않으므로 서버 모듈명은 설치 환경에 맞게 바꿔야 한다.
-
-```powershell
-python markdown_loop.py "루프 엔지니어링의 핵심과 적용 방법은?" `
-  --mcp-command python `
-  --mcp-arg=-m `
-  --mcp-arg=your_markdown_search_server `
-  --root-id workspace `
-  --max-iterations 3
-```
-
-성공하면 answer, evidence, iteration 수, query history, stop reason을 JSON으로 반환한다. 충분성 판정에 성공하면 종료 코드는 0이고, 상한·정체·오류 종료는 2다.
+테스트는 MCP 어댑터 계약과 모델 검증 로직을 테스트 더블로 확인하며, 실제 MCP 서버나 유료 모델 호출은 수행하지 않는다.
 
 ## Bedrock URL 검증 결과
 

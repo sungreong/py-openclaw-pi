@@ -7,7 +7,7 @@ toc: true
 
 # PiAgent 빠른 시작
 
-이 문서는 Docker Compose와 `piagent.sh`로 PiAgent를 처음 실행하고, 프로젝트 규칙을 적용해 첫 작업을 맡기는 가장 짧은 경로입니다. 세부 옵션은 [설정 가이드](CONFIGURATION.kr.md), 설치 방법과 문제 해결은 [초기 설정과 사용 가이드](GETTING_STARTED.kr.md)에서 확인하세요.
+이 문서는 Docker Compose 런처(`piagent.ps1` 또는 `piagent.sh`)로 PiAgent를 처음 실행하고, 프로젝트 규칙을 적용해 첫 작업을 맡기는 가장 짧은 경로입니다. 세부 옵션은 [설정 가이드](CONFIGURATION.kr.md), 설치 방법과 문제 해결은 [초기 설정과 사용 가이드](GETTING_STARTED.kr.md)에서 확인하세요.
 
 ## 시작 전 확인
 
@@ -58,7 +58,7 @@ MCP는 선택 기능입니다. 사용할 때만 예시를 개인 설정 파일�
 
 ```powershell
 Copy-Item examples/mcp_servers.example.json mcp_servers.json
-.\\piagent.ps1 -Mcp
+.\piagent.ps1 -Mcp
 ```
 
 ### 이미 컨테이너 안에 있을 때

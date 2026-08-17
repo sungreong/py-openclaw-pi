@@ -143,7 +143,7 @@ PI_WORKSPACE_EXTENSIONS_ENABLED=true
 | 기능 | 기본값 | 설정 방법 | 주의사항 |
 | --- | --- | --- | --- |
 | 메모리 | 켜짐 | `PI_NO_MEMORY=true`로 끄기 | 현재 작업과 직접 관련된 정보만 저장·조회 |
-| MCP | 켜짐 | `--no-mcp`로 끄기 | 연결 대상과 도구 범위를 검토 |
+| MCP | 전체 CLI·직접 `chat.py`는 켜짐, 런처는 꺼짐 | `PI_MCP_ENABLED`, `--no-mcp`, 런처의 `-Mcp`/`--mcp` | 연결 대상과 도구 범위를 검토 |
 | 패키지 설치 | 꺼짐 | `PI_ALLOW_PACKAGE_INSTALL=true`와 allowlist | 정확한 버전만 허용 목록에 추가 |
 
 패키지 설치 allowlist 예시:
@@ -152,6 +152,17 @@ PI_WORKSPACE_EXTENSIONS_ENABLED=true
 PI_ALLOW_PACKAGE_INSTALL=true
 PI_PACKAGE_INSTALL_ALLOWLIST=python-docx==1.2.0,matplotlib==3.11.1
 ```
+
+### MCP를 사용할 때만 설정하기
+
+저장소에는 실행용 `mcp_servers.json`을 포함하지 않습니다. 명령과 환경변수에 개인 정보가 들어갈 수 있기 때문입니다. MCP가 필요할 때만 템플릿을 복사하고, 필요한 서버만 `enabled: true`로 설정하세요.
+
+```powershell
+Copy-Item examples/mcp_servers.example.json mcp_servers.json
+.\piagent.ps1 -Mcp
+```
+
+Git Bash·WSL·macOS·Linux에서는 `./piagent.sh --mcp`를 사용합니다. 직접 전체 CLI를 실행할 때는 `--mcp-config .\mcp_servers.json`으로 다른 설정 경로를 지정할 수 있습니다. `simple_piagent.py`는 MCP를 의도적으로 사용하지 않습니다.
 
 더 많은 환경변수와 Local Bedrock 설정은 [초기 설정과 사용 가이드](GETTING_STARTED.kr.md)를 참고하세요.
 
