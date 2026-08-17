@@ -80,3 +80,6 @@ CLAUDE_CODE_TOOL_INFO.md
 
 # Local hooks config
 pi_hooks.json
+
+# Local MCP server commands and credentials (copy the tracked example first)
+mcp_servers.json
