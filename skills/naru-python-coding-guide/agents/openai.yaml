@@ -1,0 +1,4 @@
+interface:
+  display_name: "NaruWorks Python Coding Guide"
+  short_description: "Apply company-specific Python coding and review rules"
+  default_prompt: "Use $naru-python-coding-guide to review this Python code against company standards."

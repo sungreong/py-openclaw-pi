@@ -1,0 +1,11 @@
+services:
+  pi_agent:
+    container_name: pi_agent_test
+    env_file: !reset []
+    volumes: !reset []
+    environment:
+      OPENAI_API_KEY: offline-compose-check-only
+      LOCAL_BEDROCK_BASE_URL: ""
+      LOCAL_BEDROCK_MODEL_ID: ""
+      LOCAL_BEDROCK_API_KEY: ""
+    command: python -m pytest -q

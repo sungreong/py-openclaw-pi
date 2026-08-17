@@ -1,0 +1,4 @@
+interface:
+  display_name: "NaruWorks UI Design Review"
+  short_description: "Review interfaces against company UI standards"
+  default_prompt: "Use $naru-ui-design-review to review this interface against NaruWorks rules."

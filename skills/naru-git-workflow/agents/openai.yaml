@@ -1,0 +1,4 @@
+interface:
+  display_name: "NaruWorks Git Workflow"
+  short_description: "Apply company Git branch, commit, and PR rules"
+  default_prompt: "Use $naru-git-workflow to prepare a company-compliant Git change plan."

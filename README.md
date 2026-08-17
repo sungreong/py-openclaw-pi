@@ -2,14 +2,251 @@
 
 Minimal coding agent runtime inspired by OpenClaw.
 
+Start with the [Korean quick start](docs/QUICKSTART.kr.md), then use the [configuration guide](docs/CONFIGURATION.kr.md) for project instructions, permissions, sessions, skills, and MCP. The [Korean getting-started guide](docs/GETTING_STARTED.kr.md) covers local Python, Docker, Local Bedrock, full options, and troubleshooting.
+
 ## Quick Start
 
 1. Copy `.env.example` to `.env`
-2. Set `OPENAI_API_KEY`
+2. Set `OPENAI_API_KEY` or all three Local Bedrock variables
 3. Optional: adjust `PI_READ_STRATEGY` (`smart` or `legacy`)
 4. Run:
-   - CLI: `python openclaw_pi_langchain.py "your prompt"`
-   - Chat: `python chat.py`
+   - Review: `python openclaw_pi_langchain.py --mode review "your prompt"`
+   - Scoped edit: `python openclaw_pi_langchain.py --mode edit --edit-path piagent/session.py "your prompt"`
+   - Full tools (prefer an isolated environment): `python openclaw_pi_langchain.py --mode full "your prompt"`
+   - Chat check: `python chat.py --check --workspace . --no-mcp`
+   - Chat: `python chat.py --workspace . --session chat-main --mode review --no-mcp`
+
+See the [Korean agent-level and chat guide](docs/AGENT_LEVEL_AND_CHAT.kr.md) for the full chat CLI and current maturity assessment. The [20-task GPT-OSS-120B evaluation](docs/AGENT_CAPABILITY_20_RESULT.kr.md) records actual prompts, tool use, artifacts, and limitations.
+
+## PiAgent as a persistent subagent
+
+Use the JSONL bridge when another agent needs one persistent PiAgent conversation:
+
+```powershell
+python -u scripts/piagent_subagent_chat.py --jsonl --session codex-job-1 --user-id codex --mode review
+```
+
+The simplified permission interface has three modes: `review` (default, read/plan only), `edit` (one exact replacement in explicitly named existing files), and `full` (all configured tools). Start scoped editing with `--mode edit --edit-path piagent/session.py`, or send `{"prompt":"...","mode":"edit","paths":["piagent/session.py"]}` for one turn. Scoped edit mode hides `write`, `multiedit`, shell, and package installation; it also rejects undeclared paths and `replace_all` at runtime.
+
+Advanced per-turn fields such as `allowlist`, `denylist`, `skill_name`, `skill_mode`, and `plan_mode` remain available for compatibility, but cannot broaden a simplified mode. Use `{"command":"state"}` or `{"command":"exit"}` for control. Run `python scripts/run_agent_multiturn_10.py --list` to inspect the 10-scenario, 37-turn evaluation suite.
+
+## Pinned Development Environment
+
+The Docker development environment installs the verified Python package set from `requirements-piagent.lock.txt`.
+The image build uses the lock file for package reproducibility, while `docker-compose.yml` injects `.env` only at runtime.
+
+```powershell
+docker compose build --no-cache
+docker compose run --rm pi_agent python -m pytest tests/test_piagent_core.py tests/test_chat_ui.py tests/test_piagent_session.py
+```
+
+Use the test override for an isolated run without the host `.env` or development bind mount. It runs the full regression suite against the source copied into the image.
+
+```powershell
+docker compose --env-file .env.example `
+  -f docker-compose.yml -f docker-compose.test.yml build pi_agent
+
+docker compose --env-file .env.example `
+  -f docker-compose.yml -f docker-compose.test.yml run --rm pi_agent
+```
+
+`docker-compose.test.yml` supplies a fake key for tests that never call a real model. Latest stock data, chart rendering, and Word/DOCX output require additional data tools and document-generation packages in the image.
+
+To align a local Python environment with the same package versions:
+
+```powershell
+python -m pip install -r requirements-piagent.lock.txt
+```
+
+When intentionally upgrading packages, update both `requirements-piagent.txt` and the lock file, then run the full test suite.
+
+## Workspace extensions (`.piagent`)
+
+When trusted workspace extensions are enabled, PiAgent discovers this structure automatically:
+
+```text
+.piagent/
+├─ skills/
+│  └─ stock-report/
+│     └─ SKILL.md
+├─ tools/
+│  └─ stock-price/
+│     └─ tool.py
+└─ packages/               # created by python_package_install
+```
+
+Enable discovery:
+
+```powershell
+$env:PI_WORKSPACE_EXTENSIONS_ENABLED="true"
+
+# The minimal runner also accepts an explicit opt-in flag.
+python simple_piagent.py --check --workspace-extensions
+```
+
+Minimal `SKILL.md`:
+
+```markdown
+---
+name: stock-report
+description: Use for recent stock analysis and visual report requests.
+---
+
+Use verified market data and record its observation date and source.
+```
+
+Minimal `tool.py`:
+
+```python
+from langchain.tools import tool
+
+@tool
+def stock_symbol(value: str) -> str:
+    """Normalize a stock ticker symbol."""
+    return value.strip().upper()
+
+TOOLS = [stock_symbol]
+```
+
+`tool.py` must expose `TOOLS`, a list of LangChain tools, or `get_tools()` returning that list. Tool folder names accept lowercase letters, digits, and hyphens only. Builtin tool name conflicts fail startup. Enabling this feature imports Python from the workspace, so use it only with repositories you trust.
+
+Import optional dependencies inside the tool function. If one is missing, return `missing_dependency=<PyPI name>` so the model can call `python_package_install` and retry the tool. Importing a missing third-party dependency at module scope prevents the extension from loading during agent startup.
+
+### Connected Markdown Search MCP
+
+The included `.piagent/tools/markdown-search/tool.py` is a bounded read-only adapter for an already-running local Streamable HTTP MCP server. It exposes `markdown_mcp_search` and `markdown_mcp_read`; the matching `markdown-mcp-research` skill restricts the workflow to those evidence tools.
+
+The host default is `http://127.0.0.1:8811/mcp`. Docker Compose maps it to `http://host.docker.internal:8811/mcp`. Override either with `PI_MARKDOWN_SEARCH_MCP_URL`; only approved local host names are accepted.
+
+```powershell
+python simple_piagent.py --workspace-extensions --mode full `
+  --skill markdown-mcp-research `
+  "Search the Markdown MCP for agent runtime safety and cite the document paths."
+```
+
+Workspace extensions execute trusted Python during startup. `full` is required because the current permission profiles do not automatically trust custom tool names; the selected skill then narrows the active set to the two read-only Markdown tools and `ask_user`.
+
+### Workspace Python package installation
+
+The installer is disabled by default and requires an allowlist:
+
+```powershell
+$env:PI_ALLOW_PACKAGE_INSTALL="true"
+$env:PI_PACKAGE_INSTALL_ALLOWLIST="python-docx==1.2.0,matplotlib==3.11.1,pandas==3.0.5,yfinance==1.6.0"
+```
+
+The model can then call `python_package_install(package, import_name, version)`. Packages are installed under `.piagent/packages`. URLs, local paths, extras, `--index-url`, and arbitrary pip options are blocked. Prefer exact version pins. The tool is unavailable in Plan mode.
+
+## Common Usage Recipes
+
+### User-isolated runs (`--user-id`)
+
+Use `--user-id` to isolate reports, CSVs, images, sessions, audit logs, and memory stores by user.
+
+```powershell
+python openclaw_pi_langchain.py "Analyze sample/data.csv and write a report" `
+  --user-id alice
+```
+
+Outputs are stored under paths like:
+
+```text
+artifacts/users/alice/...
+artifacts/users/alice/workspace/...
+```
+
+For chat mode, set environment variables once:
+
+PowerShell:
+
+```powershell
+$env:PI_USER_ID="alice"
+$env:PI_SESSION="alice-main"
+python chat.py
+```
+
+Windows CMD:
+
+```bat
+set PI_USER_ID=alice
+set PI_SESSION=alice-main
+python chat.py
+```
+
+Linux/macOS shell:
+
+```bash
+export PI_USER_ID=alice
+export PI_SESSION=alice-main
+python chat.py
+```
+
+### Read-only planning
+
+Use this when you want analysis and an implementation plan before any edits.
+
+```powershell
+python openclaw_pi_langchain.py "Plan how to fix this feature without changing files" `
+  --plan-mode on `
+  --permission-mode plan
+```
+
+Plan mode blocks `write`, `edit`, `multiedit`, `exec`, `exec_readonly`, `memory_store`, and `work_note_update`. It keeps `plan_note_write` available so the plan can be saved to the session work note.
+
+### Work notes
+
+Pi keeps a structured work note for non-trivial planning and implementation. With `--user-id alice`, the default path is `artifacts/users/alice/work-notes/<session>.md`.
+
+```powershell
+python openclaw_pi_langchain.py "Plan this refactor and save the plan note" `
+  --user-id alice `
+  --session alice-main `
+  --plan-mode on
+```
+
+Relevant tools:
+
+- `work_note_read`: read the current session work note
+- `work_note_update`: update a section during normal implementation mode
+- `work_note_search`: grep the work note for prior decisions/errors/files
+- `plan_note_write`: save plan content while in plan mode
+
+### Long output offload
+
+Large `read`, `grep`, `exec`, and `web_fetch` results are saved to artifacts instead of being fully injected into model context.
+
+```powershell
+python openclaw_pi_langchain.py "Find the root cause in this large log" `
+  --user-id alice `
+  --max-tool-result-chars 12000 `
+  --tool-result-artifact-dir tool-results
+```
+
+The model receives a preview plus a path such as `full_result_path=artifacts/users/alice/tool-results/...`.
+
+### Subagents
+
+Pi can use the internal `delegate_task` tool with `explore`, `plan`, and `verify` read-only subagents. You can request this naturally:
+
+```powershell
+python openclaw_pi_langchain.py "Use a subagent to explore the code first, then summarize the implementation plan and verification points"
+```
+
+Disable subagents when you want one agent only:
+
+```powershell
+python openclaw_pi_langchain.py "Analyze this directly without subagents" --no-subagents
+```
+
+### Safe read-only shell checks
+
+Pi can use `exec_readonly`; it refuses commands that are not classified as read-only.
+
+```powershell
+python openclaw_pi_langchain.py "Check git status and list available tests only"
+```
+
+Dangerous or state-changing commands may also be blocked by `exec` policy.
 
 ## Tool Registry (Builtin + Custom + MCP)
 
@@ -113,10 +350,7 @@ Skills are loaded from:
 - `<workspace>/skills/*/SKILL.md`
 
 Sample skill included:
-- `skills/github-triage/SKILL.md`
-- `skills/csv-basic/SKILL.md`
-- `skills/csv-basic/scripts/csv_stats_tool.py`
-- `skills/csv-basic/data/sample_sales.csv`
+- `skills/data-report-writer/SKILL.md`
 
 Each skill uses YAML frontmatter + markdown body.
 
@@ -186,6 +420,8 @@ CLI flags:
 - `--no-mcp`
 - `--mcp-fail-fast`
 - `--mcp-timeout <seconds>`
+- `--hooks-config <path>`
+- `--user-id <id>`
 
 If one MCP server fails, Pi continues with remaining servers by default.
 Use `--mcp-fail-fast` to make startup fail on the first MCP connection error.
@@ -225,10 +461,31 @@ python openclaw_pi_langchain.py "실패 테스트를 최소 수정으로 고치�
 
 ### 4) Interactive chat per role
 
+PowerShell:
+
 ```powershell
 $env:PI_SESSION="analyst"; python chat.py
 $env:PI_SESSION="runner"; python chat.py
 $env:PI_SESSION="fixer"; python chat.py
+```
+
+Windows CMD:
+
+```bat
+set PI_SESSION=analyst
+python chat.py
+set PI_SESSION=runner
+python chat.py
+set PI_SESSION=fixer
+python chat.py
+```
+
+Linux/macOS shell:
+
+```bash
+PI_SESSION=analyst python chat.py
+PI_SESSION=runner python chat.py
+PI_SESSION=fixer python chat.py
 ```
 
 Recommended workflow:
@@ -243,6 +500,41 @@ Recommended workflow:
   - Storage: `.openclaw/memory/MEMORY.md` and `.openclaw/memory/YYYY-MM-DD.md`
 - `PI_MEMORY_MODE=legacy`
   - Uses automatic memory extract/recall compatibility flow
+
+## Example Skill: Code Health Check
+
+`skills/code-health-check/SKILL.md` runs its bundled Python scanner first, then creates a Markdown code-health report from observed metrics. A prompt containing `code health check` can select it automatically, or you can pass `--skill code-health-check` explicitly.
+
+```powershell
+python simple_piagent.py `
+  "Run a code health check and save the report to reports/code-health.md" `
+  --session code-health-demo
+```
+
+The standard-library scanner excludes `.env`, dependency directories, agent state, and private paths. Its output is a static file inventory, not evidence that tests or runtime behavior are correct.
+
+### Company policy reference examples
+
+- `naru-git-workflow` reads `references/git-policy.md` and applies company branch, commit, and PR rules.
+- `naru-ui-design-review` reads `references/ui-policy.md` and audits HTML/CSS against company design tokens and accessibility rules.
+- `naru-python-coding-guide` reads `references/python-coding-guide.md` for company-specific Python questions, reviews, and implementations.
+
+NaruWorks is a fictional policy set for evaluation, not real company information. Detailed policy is kept under `references/`, so only the selected skill loads the relevant company context. The live coding-guide results and limitations are documented in `docs/NARU_PYTHON_CODING_GUIDE_EVAL.kr.md`.
+
+## Session Memory Fragments
+
+After each run, PiAgent splits the user prompt and sanitized final answer into fragments of at most 900 characters and appends them to `<session>.fragments.jsonl` under the session directory. This append-only archive survives normal history compaction. Tool results and internal reasoning are not stored.
+
+- `session_fragment_search(query, session_id, limit, role)` returns matching fragment IDs and short snippets.
+- `session_fragment_get(ids, session_id)` retrieves up to 20 full fragments selected by ID.
+
+The agent is instructed to search first and retrieve only the needed fragments. With `--user-id`, fragments use the same per-user isolation as session history. Use this archive for exact details from the same conversation; use `memory_search`, `memory_get`, and `memory_store` for durable preferences or facts across sessions.
+
+Example prompt:
+
+```text
+Find the output format we discussed for project ORCHID. Use session_fragment_search, then verify the relevant fragment with session_fragment_get.
+```
 
 ## Blocked Path Policy (claudeignore alternative)
 
@@ -265,10 +557,16 @@ Memory tools remain available for managed memory access.
 
 ## Key Environment Variables
 
-- `OPENAI_API_KEY` (required)
+- `OPENAI_API_KEY` (required unless the local Bedrock variables below are set)
+- `LOCAL_BEDROCK_BASE_URL` (optional Bedrock Runtime endpoint; `/openai/v1` is appended automatically)
+- `LOCAL_BEDROCK_MODEL_ID` (required with `LOCAL_BEDROCK_BASE_URL`)
+- `LOCAL_BEDROCK_API_KEY` (required with `LOCAL_BEDROCK_BASE_URL`; never store it in source control)
 - `PI_MODEL`
 - `PI_WORKSPACE`
 - `PI_SESSION`
+- `PI_MODE` (`review|edit|full`, default `review`)
+- `PI_EDIT_PATHS` (comma-separated existing files allowed in `edit` mode)
+- `PI_USER_ID` (optional user namespace for artifacts/state)
 - `PI_MAX_MODEL_CALLS`
 - `PI_TOOL_REPEAT_LIMIT` (default `3`; aborts when identical tool calls repeat this many times in one run)
 - `PI_EXEC_TIMEOUT`
@@ -288,6 +586,62 @@ Memory tools remain available for managed memory access.
 - `PI_SKILL_MODE` (`auto|manual|off`)
 - `PI_SKILL` (optional explicit skill id/name)
 - `PI_PLAN_MODE` (`on|off`, default `off`)
+- `PI_PERMISSION_MODE` (`default|plan|accept_edits|dont_ask`, default `default`)
+- `PI_NO_SUBAGENTS` (`true` disables `delegate_task`)
+- `PI_MAX_TOOL_RESULT_CHARS` (default `24000`; larger tool results are offloaded)
+- `PI_TOOL_RESULT_ARTIFACT_DIR` (default `tool-results`)
+- `PI_NO_SESSION_NOTES` (`true` disables session notes)
+- `PI_NO_WORK_NOTES` (`true` disables structured work notes)
+- `PI_WORK_NOTE_ARTIFACT_DIR` (default `work-notes`)
+- `PI_NO_WORK_NOTE_AUTO_UPDATE` (`true` disables automatic worklog append)
+- `PI_HOOKS_CONFIG` (default `pi_hooks.json`)
+
+### Local Bedrock Runtime
+
+Set all three variables to route both the main and compaction models through Bedrock's OpenAI-compatible Chat Completions API:
+
+```powershell
+$env:LOCAL_BEDROCK_BASE_URL="https://bedrock-runtime.ap-northeast-1.amazonaws.com"
+$env:LOCAL_BEDROCK_MODEL_ID="openai.gpt-oss-120b-1:0"
+$env:LOCAL_BEDROCK_API_KEY="<your Bedrock API key>"
+python openclaw_pi_langchain.py "Hello"
+```
+
+Pi validates the HTTPS Bedrock Runtime host and appends `/openai/v1` when the root endpoint is provided. Never commit the API key.
+
+## Core CLI Flags
+
+- `--user-id <id>`: isolate artifacts/session/audit/memory per user
+- `--session <id>`: separate conversation history
+- `--workspace <path>`: set the workspace root
+- `--plan-mode on|off`: read-only planning mode
+- `--permission-mode default|plan|accept_edits|dont_ask`: runtime permission mode
+- `--no-subagents`: disable `delegate_task`
+- `--max-tool-result-chars <n>`: preview limit before tool-result offload
+- `--tool-result-artifact-dir <path>`: artifact subdirectory for long tool results
+- `--no-session-notes`: disable session note writes
+- `--no-work-notes`: disable structured work note tools and auto updates
+- `--work-note-artifact-dir <path>`: artifact subdirectory for work notes
+- `--no-work-note-auto-update`: disable automatic worklog updates after each run
+- `--allow-tool <name>` / `--deny-tool <name>`: restrict tools for this run
+- `--blocked-path <pattern>`: add blocked path patterns
+
+## User-Isolated Artifacts
+
+When `PI_USER_ID` or `--user-id` is set, Pi enforces isolated artifact paths:
+
+- `reports/**`, `artifacts/**`, `outputs/**` are rewritten under:
+  - `artifacts/users/<user_id>/...`
+- In addition, `write` for new ad-hoc paths (for example `time_series_data.csv`, `plot.py`) is forced to:
+  - `artifacts/users/<user_id>/workspace/<original-relative-path>`
+- Top-level filenames (for example `foo.csv`, `script.py`) are always forced into user artifact workspace in user mode, even if a same-name file already exists in workspace root.
+- Cross-user artifact paths (e.g. `artifacts/users/<other_id>/...`) are blocked.
+- Session/audit/memory stores are namespaced per user:
+  - `<session_dir>/users/<user_id>/...`
+  - `<audit_dir>/users/<user_id>/...`
+  - `<memory_dir>/users/<user_id>/...`
+
+This keeps outputs from different users separated by default.
 
 ## Todo Tools (Session Task Tracking)
 
@@ -343,11 +697,21 @@ Status icons: `[ ]` pending · `[~]` in_progress · `[x]` completed · `[-]` can
 
 - Enable with chat command `/plan on`, CLI `--plan-mode on`, or env `PI_PLAN_MODE=on`.
 - In plan mode, Pi enforces read-only planning behavior:
-  - blocked tools: `write`, `edit`, `exec`, `memory_store`
-  - allowed tools (subject to existing policy): `read`, `ls`, `find`, `grep`, `memory_search`, `memory_get`
+  - blocked tools: `write`, `edit`, `multiedit`, `exec`, `exec_readonly`, `memory_store`, `work_note_update`
+  - allowed tools (subject to existing policy): `read`, `ls`, `find`, `grep`, `memory_search`, `memory_get`, `work_note_read`, `work_note_search`, `plan_note_write`
+- Final plans are guided toward `<proposed_plan>...</proposed_plan>` with goal, critical files, steps, tests, and assumptions.
+- `plan_note_write` can save the plan into `artifacts/users/<user>/work-notes/<session>.md`.
 - Skill precheck failures are relaxed in plan mode so Pi can still return a plan response.
 - Legacy auto-memory write is disabled while plan mode is on.
 - Disable with `/plan off` or `--plan-mode off`.
+
+## Subagents and Read-only Execution
+
+- `delegate_task(description, prompt, agent_type)` delegates bounded work to a read-only subagent.
+- Supported types: `explore`, `plan`, `verify`.
+- Subagents can read/search/verify and inspect work notes, but cannot `write`, `edit`, `multiedit`, `exec`, `memory_store`, `work_note_update`, or delegate again.
+- `exec_readonly(command, cwd, timeout_s)` runs only commands classified as read-only.
+- Large `read`, `grep`, `work_note_search`, `exec`, and `web_fetch` results return a preview plus `full_result_path`; the complete output is saved as an artifact.
 
 ## Exec Failure Guard (v1)
 

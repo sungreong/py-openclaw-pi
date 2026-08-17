@@ -1,27 +1,22 @@
-FROM ubuntu:24.04
+FROM python:3.12-slim
 
-# 시간대 설정 등 상호작용 방지
-ENV DEBIAN_FRONTEND=noninteractive
-ENV PYTHONUNBUFFERED=1
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
 
-# 우분투 패키지 업데이트 및 Python 3.12 설치
-RUN apt-get update && apt-get install -y \
-    python3.12 \
-    python3.12-venv \
-    python3-pip \
-    python3.12-dev \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     git \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# python을 python3.12로 연결
-RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1 && \
-    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1
-
 WORKDIR /app
 
-# 파이썬 패키지 설치를 위해 요구사항 파일 복사 및 설치
-# Ubuntu 24.04부터는 PEP 668에 의해시스템 전역 패키지 설치 시 --break-system-packages 플래그가 필요합니다.
-COPY requirements-openclaw-pi-langchain.txt /tmp/
-RUN pip install --no-cache-dir --break-system-packages -r /tmp/requirements-openclaw-pi-langchain.txt
+COPY requirements-piagent.lock.txt requirements-piagent-documents.txt /tmp/
+RUN python -m pip install --upgrade pip \
+    && python -m pip install -r /tmp/requirements-piagent.lock.txt \
+    && python -m pip install -r /tmp/requirements-piagent-documents.txt
+
+# Keep the image runnable without the development bind mount. Sensitive and
+# generated paths are excluded by .dockerignore.
+COPY . /app

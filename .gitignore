@@ -1,20 +1,82 @@
-# Environments
+# Environments and local credentials
 .env
+.env.*
+!.env.example
+!.env.*.example
 .venv/
 venv/
 env/
 
+# Private keys and credential files
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.kdbx
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+credentials*.json
+client_secret*.json
+service-account*.json
+service_account*.json
+*.secrets.json
+.npmrc
+.pypirc
+.netrc
+secrets/
+private/
+
 # Python
 __pycache__/
 *.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # Agent Storage
 .openclaw_pi/
 .openclaw/
 ai_docs
+
+# Local agent clients and generated skill mirrors
+.agents/
+.claude/
+.codegraph/
+.codex/
+.cursor/
+.gemini/
+.mps/
+.skillbridge/
+codegraph_skills/
+
+# PiAgent local dependency cache (keep .piagent/skills and .piagent/tools trackable)
+.piagent/packages/
+.piagent/INSTRUCTIONS.md
+
+# Temporary evaluation workspaces
+.tmp/
+
 # IDE
 .idea/
 .vscode/
 
 sample/result/*
 sample/*.py
+sample/*.csv
+sample/venv/
+
+# Generated artifacts and outputs
+artifacts/
+reports/
+repos/
+
+# Claude Code internals
+CLAUDE_CODE_SYSTEM_PROMPT.md
+CLAUDE_CODE_TOOL_INFO.md
+
+# Local hooks config
+pi_hooks.json

@@ -1,0 +1,4 @@
+# Document extension profile installed in the Docker image.
+# Keep these exact pins aligned with the package-install allowlist.
+python-docx==1.2.0
+lxml==5.3.0

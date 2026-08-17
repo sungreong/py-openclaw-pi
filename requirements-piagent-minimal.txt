@@ -1,0 +1,12 @@
+# Minimal verified runtime set for simple_piagent.py.
+# Compatibility packages are pinned because unconstrained LangGraph transitive
+# upgrades currently produce an import-time version mismatch.
+langchain==1.2.10
+langchain-core==1.2.17
+langgraph==1.0.10
+langgraph-checkpoint==4.0.1
+langgraph-prebuilt==1.0.8
+langgraph-sdk==0.3.9
+langchain-openai==1.1.10
+openai==2.24.0
+python-dotenv==1.0.1

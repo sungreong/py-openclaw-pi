@@ -2,4 +2,4 @@ version: 1
 interface:
   display_name: Data Report Writer
   short_description: Run local profiler stats and save an evidence-based markdown report.
-  default_prompt: Analyze this local data file with the skill profiler, then save a markdown summary report under reports/.
+  default_prompt: Analyze this local data file with the skill profiler, then save a markdown summary report under the user-isolated artifacts path (or reports/ when no user id).
