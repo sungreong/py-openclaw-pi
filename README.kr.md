@@ -13,6 +13,8 @@ OpenClaw에서 영감을 받은 최소 코딩 에이전트 런타임입니다.
 
 처음에는 빠른 시작을 완료한 뒤, 필요한 설정만 설정 가이드에서 추가하세요.
 
+Docker Compose를 사용한다면 Windows PowerShell에서는 `.\piagent.ps1`, Git Bash·WSL·macOS·Linux에서는 `./piagent.sh`로 안전한 `review` 채팅을 바로 열 수 있습니다. 구현 작업은 `-Mode full` 또는 `--full`, 설정 확인은 `-Check` 또는 `--check`를 사용하세요.
+
 ## 명령 빠른 참조
 
 1. `.env.example` 파일을 `.env`로 복사합니다.
