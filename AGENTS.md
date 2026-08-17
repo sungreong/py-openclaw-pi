@@ -170,7 +170,7 @@ OpenClaw 메모리 도구가 필요한 경우 최소 범위로 사용한다.
 - `tests/test_piagent_core.py`: 핵심 회귀 테스트
 - `skills/data-report-writer/SKILL.md`: 샘플 스킬
 - `requirements-piagent.txt`: Python 의존성
-- `mcp_servers.json`: MCP server 설정 예시
+- `examples/mcp_servers.example.json`: MCP server 설정 템플릿
 - `Dockerfile`, `docker-compose.yml`: 컨테이너 실행 환경
 - `README.md`, `README.kr.md`: 사용자 문서
 
