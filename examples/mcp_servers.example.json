@@ -1,0 +1,31 @@
+{
+  "servers": [
+    {
+      "name": "filesystem",
+      "enabled": false,
+      "transport": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "."
+      ],
+      "env": {},
+      "timeout_s": 20
+    },
+    {
+      "name": "custom_python",
+      "enabled": false,
+      "transport": "stdio",
+      "command": "python",
+      "args": [
+        "-m",
+        "your_mcp_server"
+      ],
+      "env": {
+        "API_KEY": "${YOUR_API_KEY}"
+      },
+      "timeout_s": 30
+    }
+  ]
+}
