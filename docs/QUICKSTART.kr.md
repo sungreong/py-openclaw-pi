@@ -33,7 +33,11 @@ PI_MODEL=gpt-4o-mini
 
 Local Bedrock을 쓸 때는 `LOCAL_BEDROCK_BASE_URL`, `LOCAL_BEDROCK_MODEL_ID`, `LOCAL_BEDROCK_API_KEY`를 모두 설정합니다. 키 값은 채팅, 로그, 문서, Git에 넣지 마세요.
 
-## 2. 한 명령으로 시작과 진단
+## 2. 실행 위치에 맞게 시작과 진단
+
+호스트와 컨테이너 내부의 역할은 다릅니다. 호스트 스크립트는 Docker Compose로 컨테이너를 준비하고, 컨테이너 내부 스크립트는 Python을 바로 실행합니다. 두 위치에서 같은 `piagent.sh`를 실행해도 자동으로 알맞은 동작을 선택합니다.
+
+### 호스트에서 실행 (권장)
 
 Windows PowerShell:
 
@@ -48,7 +52,24 @@ Git Bash·WSL·macOS·Linux shell:
 ./piagent.sh --check
 ```
 
-스크립트는 Docker 컨테이너를 준비하고 `--check`에서는 모델을 호출하지 않고 도구·스킬·모델 연결 경로만 확인합니다. `.env`가 없으면 `.env.example`을 복사한 뒤 멈추므로, 키를 입력하고 같은 명령을 다시 실행하세요. `status: "ok"`가 보이면 다음 단계로 진행합니다.
+호스트 스크립트는 Docker 컨테이너를 준비합니다. `--check`에서는 모델을 호출하지 않고 도구·스킬·모델 연결 경로만 확인합니다. `.env`가 없으면 `.env.example`을 복사한 뒤 멈추므로, 키를 입력하고 같은 명령을 다시 실행하세요. `status: "ok"`가 보이면 다음 단계로 진행합니다.
+
+### 이미 컨테이너 안에 있을 때
+
+먼저 컨테이너에 접속합니다.
+
+```sh
+docker compose exec pi_agent bash
+```
+
+프롬프트가 `root@...:/app#`처럼 바뀐 뒤에는 Docker를 다시 실행하지 않습니다. 같은 명령이 Python을 직접 실행합니다.
+
+```sh
+./piagent.sh --check
+./piagent.sh --full --session first-work
+```
+
+컨테이너 내부에서는 `chmod +x ./piagent.sh`가 필요 없습니다. 실행 권한이 보존되지 않은 환경에서는 `sh ./piagent.sh --check`로 실행할 수 있습니다.
 
 ## 3. 프로젝트 공통 규칙 만들기
 

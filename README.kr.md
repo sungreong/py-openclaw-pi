@@ -13,7 +13,7 @@ OpenClaw에서 영감을 받은 최소 코딩 에이전트 런타임입니다.
 
 처음에는 빠른 시작을 완료한 뒤, 필요한 설정만 설정 가이드에서 추가하세요.
 
-Docker Compose를 사용한다면 Windows PowerShell에서는 `.\piagent.ps1`, Git Bash·WSL·macOS·Linux에서는 `./piagent.sh`로 안전한 `review` 채팅을 바로 열 수 있습니다. 구현 작업은 `-Mode full` 또는 `--full`, 설정 확인은 `-Check` 또는 `--check`를 사용하세요.
+Docker Compose를 사용한다면 Windows PowerShell에서는 `.\piagent.ps1`, Git Bash·WSL·macOS·Linux에서는 `./piagent.sh`로 안전한 `review` 채팅을 바로 열 수 있습니다. 이 명령은 호스트에서는 Compose를 준비하고, `root@...:/app#`처럼 이미 `pi_agent` 컨테이너 안에서는 Python을 직접 실행합니다. 구현 작업은 `-Mode full` 또는 `--full`, 설정 확인은 `-Check` 또는 `--check`를 사용하세요. 자세한 구분은 [빠른 시작의 실행 위치 안내](docs/QUICKSTART.kr.md#2-실행-위치에-맞게-시작과-진단)를 참고하세요.
 
 ## 명령 빠른 참조
 

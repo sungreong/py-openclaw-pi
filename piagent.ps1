@@ -58,18 +58,19 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
+$containerArgs = @("exec", "pi_agent", "/app/scripts/piagent-container.sh")
 if ($Check) {
-    & docker compose exec pi_agent python simple_piagent.py --workspace /app --check
-    exit $LASTEXITCODE
+    $containerArgs += "--check"
+} else {
+    $containerArgs += "--$Mode"
+    $containerArgs += @("--session", $Session)
 }
-
-$chatArgs = @("exec", "pi_agent", "python", "chat.py", "--workspace", "/app", "--session", $Session, "--mode", $Mode)
 if ($Mode -eq "edit") {
-    $chatArgs += @("--edit-path", $EditPath)
+    $containerArgs += $EditPath
 }
-if (-not $Mcp) {
-    $chatArgs += "--no-mcp"
+if ($Mcp) {
+    $containerArgs += "--mcp"
 }
 
-& docker compose @chatArgs
+& docker compose @containerArgs
 exit $LASTEXITCODE

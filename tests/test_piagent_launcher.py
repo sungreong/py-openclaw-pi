@@ -3,16 +3,28 @@ from __future__ import annotations
 from pathlib import Path
 
 
-def test_piagent_shell_launcher_exposes_safe_modes_and_docker_entrypoint():
+def test_piagent_shell_launcher_dispatches_host_and_container_contexts():
     script = (Path(__file__).resolve().parents[1] / "piagent.sh").read_text(encoding="utf-8")
 
     assert script.startswith("#!/usr/bin/env sh")
-    assert "mode=\"review\"" in script
-    assert "--full" in script
-    assert "--edit" in script
-    assert "--check" in script
-    assert "docker compose up -d --build pi_agent" in script
-    assert "python chat.py --workspace /app" in script
+    assert "-f /.dockerenv" in script
+    assert "scripts/piagent-host.sh" in script
+    assert "scripts/piagent-container.sh" in script
+
+
+def test_piagent_host_and_container_scripts_have_separate_responsibilities():
+    root = Path(__file__).resolve().parents[1]
+    host = (root / "scripts" / "piagent-host.sh").read_text(encoding="utf-8")
+    container = (root / "scripts" / "piagent-container.sh").read_text(encoding="utf-8")
+
+    assert "docker compose up -d --build pi_agent" in host
+    assert "/app/scripts/piagent-container.sh" in host
+    assert "mode=\"review\"" in container
+    assert "--full" in container
+    assert "--edit" in container
+    assert "--check" in container
+    assert "python chat.py" in container
+    assert "docker compose" not in container
 
 
 def test_piagent_powershell_launcher_exposes_the_same_core_modes():
@@ -22,4 +34,4 @@ def test_piagent_powershell_launcher_exposes_the_same_core_modes():
     assert 'ValidateSet("review", "full", "edit")' in script
     assert "[switch]$Check" in script
     assert "docker compose up -d --build pi_agent" in script
-    assert '"python", "chat.py"' in script
+    assert '"/app/scripts/piagent-container.sh"' in script
