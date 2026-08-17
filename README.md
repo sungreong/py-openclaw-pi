@@ -253,7 +253,7 @@ Dangerous or state-changing commands may also be blocked by `exec` policy.
 Pi merges tools in this order:
 1. Builtin tools (`read`, `write`, `edit`, `ls`, `find`, `grep`, `exec`, memory tools, todo tools)
 2. Custom Python tools (module loader)
-3. MCP tools (from `mcp_servers.json`)
+3. MCP tools (from a user-provided MCP config)
 
 Final tool access is still controlled by `--allow-tool` / `--deny-tool`.
 
@@ -307,9 +307,13 @@ Conflict policy:
 
 ### MCP server tools
 
-Default config file: `mcp_servers.json` in workspace root.
+MCP is optional. The runtime looks for `mcp_servers.json` in the workspace root only when MCP is enabled. Create that local file from the tracked template; the live config is ignored by Git because it may contain commands and credentials.
 
-Example config (`mcp_servers.json`):
+```powershell
+Copy-Item examples/mcp_servers.example.json mcp_servers.json
+```
+
+Example template (`examples/mcp_servers.example.json`):
 
 ```json
 {
