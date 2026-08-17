@@ -80,7 +80,7 @@ docker compose exec pi_agent python chat.py `
 ```
 
 ```text
-weather.py와 테스트 파일을 만들고, 테스트를 실행한 뒤 변경 파일과 결과를 한국어로 요약해줘.
+요청한 기능의 모듈과 테스트 파일을 만들고, 테스트를 실행한 뒤 변경 파일과 결과를 한국어로 요약해줘.
 ```
 
 Docker Compose는 현재 폴더를 컨테이너의 `/app`에 연결합니다. 따라서 `full` 모드에서 생성·수정한 파일은 호스트 프로젝트에도 즉시 반영됩니다.
@@ -100,4 +100,3 @@ Docker Compose는 현재 폴더를 컨테이너의 `/app`에 연결합니다. �
 - 프로젝트 공통 규칙, 세션, 사용자 격리, 스킬, 메모리, MCP 설정: [설정 가이드](CONFIGURATION.kr.md)
 - 로컬 Python 설치, Local Bedrock, 확장 도구, 문제 해결: [초기 설정과 사용 가이드](GETTING_STARTED.kr.md)
 - 채팅 명령과 현재 지원 범위: [대화형 에이전트 사용법](AGENT_LEVEL_AND_CHAT.kr.md)
-
