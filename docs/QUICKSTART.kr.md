@@ -54,6 +54,13 @@ Git Bash·WSL·macOS·Linux shell:
 
 호스트 스크립트는 Docker 컨테이너를 준비합니다. `--check`에서는 모델을 호출하지 않고 도구·스킬·모델 연결 경로만 확인합니다. `.env`가 없으면 `.env.example`을 복사한 뒤 멈추므로, 키를 입력하고 같은 명령을 다시 실행하세요. `status: "ok"`가 보이면 다음 단계로 진행합니다.
 
+MCP는 선택 기능입니다. 사용할 때만 예시를 개인 설정 파일로 복사하고 필요한 서버만 `enabled: true`로 바꾸세요. 이 설정에는 명령과 환경변수가 들어갈 수 있으므로 Git에 올리지 않습니다.
+
+```powershell
+Copy-Item examples/mcp_servers.example.json mcp_servers.json
+.\\piagent.ps1 -Mcp
+```
+
 ### 이미 컨테이너 안에 있을 때
 
 먼저 컨테이너에 접속합니다.
