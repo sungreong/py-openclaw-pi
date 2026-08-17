@@ -584,20 +584,11 @@ ID는 자동 할당됩니다 (1부터 순서대로).
 
 ## Markdown 검색 검증 루프
 
-`markdown_loop.py`는 `markdown_search` 호환 stdio MCP를 대상으로 검색 → 읽기 → 초안 → 별도 verifier → 질의 보정/종료를 실행하는 최소 LangGraph 예제입니다.
+`piagent/markdown_loop.py`는 `markdown_search` 호환 MCP를 대상으로 검색 → 읽기 → 초안 → 별도 verifier → 질의 보정/종료를 구현한 **재사용용 내부 모듈**입니다. 루트 `markdown_loop.py` 실행기는 제거되었으므로 별도 CLI 명령은 제공하지 않습니다.
 
-```powershell
-python markdown_loop.py --check
-
-python markdown_loop.py "루프 엔지니어링의 핵심은?" `
-  --mcp-command python `
-  --mcp-arg=-m `
-  --mcp-arg=your_markdown_search_server
-```
-
-- 필요한 MCP 도구: `search_markdown`, `read_markdown`
+- 필요한 MCP 도구 계약: `search_markdown`, `read_markdown`
 - 안전 종료: 근거 충분, 최대 반복, 반복 질의, 검색/읽기/검증 오류
-- 실제 서버 실행 명령은 저장소에 포함되어 있지 않습니다.
+- 구현 계약 검증: `python -m pytest tests/test_markdown_loop.py -q`
 - 상세 설계·검증·한계: `docs/MARKDOWN_LOOP_ENGINEERING_REPORT.kr.md`
 
 ### 연결된 Markdown Search HTTP MCP 사용
